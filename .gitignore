@@ -1,0 +1,70 @@
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.env
+*.env.*
+!*.env.example
+.envrc
+.direnv/
+config.env
+
+# Editors and local tooling
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Downloaded third-party source and build output
+/third_party/
+/build/
+/whisper.cpp/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dSYM/
+
+# Models, partial downloads, and local media
+/models/
+*.bin
+*.ggml
+*.gguf
+*.onnx
+*.safetensors
+*.pt
+*.pth
+*.mlmodelc/
+*.part
+*.part.*
+*.m4a
+*.mp3
+*.wav
+*.flac
+
+# Runtime state and generated validation output
+/var/
+/logs/
+/run/
+/state/
+*.log
+*.pid
+
+# Temporary files and archives
+*.tmp
+*.temp
+*.bak
+*.zip
+*.tar
+*.tar.gz
