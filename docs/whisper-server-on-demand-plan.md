@@ -341,8 +341,8 @@ WHISPER_START_FAILURE_BACKOFF_SECONDS="10"
 | `client/verify-server.sh` | 接受 cold health，测量首请求冷启动，验证空闲退出后再次唤醒 |
 | `install.sh` | 增加显式 `--on-demand` 安装入口；第一版不静默改变默认运行模式 |
 | `README.md` | 增加部署、日常管理、冷启动预期和回滚入口 |
-| `docs/execution-handoff.md` | 增加逐阶段证据与不得误报完成的要求 |
-| `docs/server-info.md` | 实施成功后更新实际 PID、端口、launchd 和日志信息 |
+| `README.md` | 增加逐阶段证据、日常管理和不得误报完成的要求 |
+| `docs/whisper-cpp-server-guide.md` | 更新实际 PID、端口、launchd 和日志信息 |
 | `docs/whisper-cpp-server-guide.md` | 说明网关 health/ready 语义与 direct/on-demand 两种模式 |
 
 不得直接覆盖当前脚本行为后再测试。先增加独立入口，在验收全部通过后才把按需模式标记为推荐。
@@ -436,7 +436,7 @@ WHISPER_START_FAILURE_BACKOFF_SECONDS="10"
 
 ### 阶段 E：文档和交接
 
-更新 README、`docs/server-info.md`、使用指南和执行交接文档，附实际命令输出。只有全部验收项有证据后，才把
+更新 README、使用指南和脚本交接说明，附实际命令输出。只有全部验收项有证据后，才把
 按需模式写成“已安装/已验证”。
 
 ## 15. 验收矩阵

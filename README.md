@@ -1,257 +1,279 @@
-# Mac mini M4 Whisper Server
+# Mac mini Whisper Server
 
-本项目在 Apple Silicon Mac mini 上构建并运行 `whisper.cpp`，向可信局域网内的 OpenWhispr 提供兼容的转写接口。安装、校验、启停和跨机器验收都由可重复执行的脚本完成。
+本项目在 Apple Silicon Mac mini 上构建并运行固定版本的 `whisper.cpp`，向可信局域网内的 OpenWhispr 提供兼容 OpenAI 风格的语音转写接口。仓库包含安装、构建、模型校验、服务启停、局域网验收，以及控制端 SSH/Wake-on-LAN（WOL）前置配置脚本。
 
-目录布局、运行状态检查和手动启动说明见：[server-info.md](./docs/server-info.md)。
-命令、参数、HTTP API、调优和兼容性说明见：
-[whisper-cpp-server-guide.md](./docs/whisper-cpp-server-guide.md)。
+## 关键组件
 
-## 项目布局
+| 组件 | 作用 | 入口 |
+|---|---|---|
+| `whisper-server` | 加载模型并提供 HTTP 转写服务 | `build/whisper.cpp/bin/whisper-server` |
+| `whisper-cli` | 本机音频转写和冒烟测试 | `build/whisper.cpp/bin/whisper-cli` |
+| SSH/WOL 设置脚本 | 在控制端生成 SSH 配置片段和 WOL 代理 | `scripts/00-setup-ssh-wol.sh` |
+| 系统依赖脚本 | 检查/安装 Homebrew、Git、CMake、FFmpeg | `scripts/01-install-dependencies.sh` |
+| 预检脚本 | 检查 macOS、arm64、工具链、磁盘和端口 | `scripts/00-preflight.sh` |
+| 构建脚本 | 拉取固定 `whisper.cpp` commit 并启用 Metal | `scripts/02-build-whisper.sh` |
+| 模型脚本 | 下载并校验 `large-v3-turbo` | `scripts/03-download-model.sh` |
+| CLI 验证脚本 | FFmpeg 转 WAV 后执行本机转写 | `scripts/04-validate-cli.sh` |
+| 服务管理脚本 | `start/status/logs/stop/foreground` | `scripts/05-server.sh` |
+| 防火墙脚本 | 检查或放行精确的 server 二进制 | `scripts/06-firewall.sh` |
+| LAN 客户端脚本 | 验证 `/health` 和 multipart 转写 | `client/verify-server.sh` |
+| API/参数指南 | 详细说明 whisper.cpp、HTTP API 和故障排查 | `docs/whisper-cpp-server-guide.md` |
+| 按需启动方案 | 尚未实施的网关/空闲退出设计 | `docs/whisper-server-on-demand-plan.md` |
+
+当前固定基线：`whisper.cpp v1.9.2`，commit `306c88f4d1286aec1bf96e544632897886af5501`；Release + Metal；模型 `ggml-large-v3-turbo.bin`，大小 `1624555275` bytes，SHA-256 `1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69`。
+
+## 文件夹结构
 
 ```text
 .
-├── install.sh                 # 一键安装入口
-├── scripts/                   # 服务端安装、构建和管理脚本
-├── client/                    # LAN 客户端验收脚本
-├── docs/                      # 运维、API 和后续方案文档
-├── .env.example               # 可提交的默认配置
-├── .env                       # 可选的本地覆盖，不进入 Git
-├── third_party/whisper.cpp/   # 下载的上游源码，不进入 Git
-├── build/whisper.cpp/         # 编译产物，不进入 Git
-├── models/                    # 模型与断点文件，不进入 Git
-└── var/{log,run,state}/       # 日志、PID 和状态，不进入 Git
+├── install.sh                       # 一键执行依赖、预检、构建、模型和 CLI 验证
+├── scripts/
+│   ├── 00-setup-ssh-wol.sh          # 控制端 SSH/WOL 本地配置
+│   ├── 00-preflight.sh              # Mac mini 系统预检
+│   ├── 01-install-dependencies.sh  # Homebrew/Git/CMake/FFmpeg
+│   ├── 02-build-whisper.sh          # 固定版本构建
+│   ├── 03-download-model.sh         # 模型下载和校验
+│   ├── 04-validate-cli.sh           # 本机 CLI 验收
+│   ├── 05-server.sh                 # server 生命周期管理
+│   ├── 06-firewall.sh               # Application Firewall
+│   └── lib/common.sh                # 配置、路径和公共函数
+├── client/verify-server.sh          # 另一台 LAN 电脑的验收脚本
+├── docs/whisper-cpp-server-guide.md # API 和详细运行指南
+├── docs/whisper-server-on-demand-plan.md # 尚未实施的按需方案
+├── .env.example                     # 可提交的配置模板
+├── .env                              # 当前机器本地配置，不进入 Git
+├── third_party/whisper.cpp/         # 下载的上游源码，不进入 Git
+├── build/whisper.cpp/               # 编译产物，不进入 Git
+├── models/                           # 模型及断点文件，不进入 Git
+└── var/{log,run,state}/             # 日志、PID、构建/模型状态，不进入 Git
 ```
 
-脚本根据自身位置确定项目根，因此仓库移动或克隆到不同目录后无需改绝对路径。默认配置直接读取 `.env.example`；需要自定义时执行：
+`third_party/`、`build/`、`models/` 和 `var/` 都由 `.gitignore` 排除；模型、日志、PID 和编译产物不会提交到 GitHub。仓库脚本根据自身位置推导项目根，移动仓库后不需要修改代码中的用户目录。
 
-```bash
-cp .env.example .env
-```
+## 配置
 
-只修改 `.env`。它已被 `.gitignore` 排除。
-
-LAN 客户端使用的主机名或 IP 由 `WHISPER_LAN_HOST` 配置。默认值在运行时从当前 macOS
-主机名动态读取；如果局域网 DNS/Bonjour 不提供该名称，请在 `.env` 中改成服务端的 LAN IP。
-
-## 最终产物
-
-- 项目根：仓库所在目录
-- 源码：`third_party/whisper.cpp`
-- 固定版本：`v1.9.2` / commit `306c88f4d1286aec1bf96e544632897886af5501`
-- 构建：原生 `arm64`、Release、Metal ON
-- 模型：`ggml-large-v3-turbo.bin`
-- 模型 SHA-256：`1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69`
-- 监听：`0.0.0.0:8080`
-- 健康检查：`GET /health`
-- 转写接口：`POST /v1/audio/transcriptions`
-- 音频转换：server 端启用 `--convert`，依赖 FFmpeg
-- 语言：启动默认 `auto`
-
-安装根目录、端口、线程数等均可在 `.env` 中调整。
-
-## 快速开始
-
-先准备一段真实中文录音和一段真实英文录音。然后：
+首次部署时复制模板：
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
-chmod +x install.sh scripts/*.sh client/*.sh
-./install.sh \
-  --audio /path/to/chinese.m4a \
-  --audio /path/to/english.m4a \
-  --start
+cp .env.example .env
+source .env
 ```
 
-如果目标机尚未安装 Homebrew，第一次增加：
+`.env` 是本机配置，不要提交。服务端常用参数包括：
 
 ```bash
-./install.sh --install-homebrew \
-  --audio /path/to/chinese.m4a \
-  --audio /path/to/english.m4a \
-  --start
+WHISPER_HOST="0.0.0.0"
+WHISPER_PORT="8080"
+WHISPER_INFERENCE_PATH="/v1/audio/transcriptions"
+WHISPER_LANGUAGE="auto"
+WHISPER_THREADS="4"
+WHISPER_LAN_HOST="<Mac-mini-mDNS-name-or-LAN-IP>"
 ```
 
-模型约 1.5 GiB，下载和 SHA-256 校验都需要时间。脚本可重复运行；模型下载使用 `.part` 文件断点续传。
+SSH/WOL 还需要由部署者填写目标网卡的 `WHISPER_WOL_BROADCAST` 和 `WHISPER_WOL_MAC`。模板不会包含真实用户名、主机名、MAC、IP、密钥或设备指纹。
 
-## 详细流程与原文 1–5 步对应关系
+## 0. SSH 和 Wake-on-LAN 前置设置
 
-### 1. 准备系统
+这一步应在控制端（例如你的 MacBook）执行。WOL 只负责唤醒网卡，SSH 仍负责主机密钥校验和公钥认证；脚本不会复制私钥、修改远端文件或自动执行远端 `sudo`。
 
-先人工检查 macOS 更新：
+### 0.1 控制端生成本地配置
+
+在控制端仓库的 `.env` 中填写目标 Mac mini 参数：
+
+```bash
+WHISPER_SSH_ALIAS="macmini-m4"
+WHISPER_SSH_HOST="<Mac-mini-mDNS-name-or-IP>"
+WHISPER_SSH_USER="<Mac-mini-login-user>"
+WHISPER_SSH_PORT="22"
+WHISPER_SSH_IDENTITY_FILE="${HOME}/.ssh/macmini-m4-ed25519"
+WHISPER_WOL_BROADCAST="<LAN-broadcast-address>"
+WHISPER_WOL_MAC="<Mac-mini-ethernet-MAC>"
+```
+
+然后运行：
+
+```bash
+./scripts/00-setup-ssh-wol.sh configure
+./scripts/00-setup-ssh-wol.sh check
+```
+
+脚本会在控制端生成并设置权限：
+
+- `~/.ssh/config.d/whisper-custom-host.conf`：SSH 别名、用户、私钥、保活和 `ProxyCommand`；
+- `~/.ssh/macmini-m4-wake-proxy`：发送 WOL 魔术包、等待 TCP 22、再把字节流交给 SSH；
+- `~/.ssh/config` 中的 `Include` 行（已有其它 SSH 配置不会被覆盖）。
+
+如果私钥不存在，脚本只会提示，不会自动生成或上传：
+
+```bash
+ssh-keygen -t ed25519 -f "${WHISPER_SSH_IDENTITY_FILE}"
+chmod 600 "${WHISPER_SSH_IDENTITY_FILE}"
+```
+
+### 0.2 Mac mini 上的手动设置
+
+以下动作必须在 Mac mini 本机图形界面或已有管理员会话中完成：
+
+1. 在“系统设置 → 通用 → 共享”开启“远程登录（Remote Login）”，只允许需要登录的用户。
+2. 首次授权公钥时，确认目标主机密钥指纹后，把控制端的 `.pub` 内容追加到 Mac mini 的 `~/.ssh/authorized_keys`。不要复制私钥：
+
+   ```bash
+   cat "${WHISPER_SSH_IDENTITY_FILE}.pub" | \
+     ssh -o ProxyCommand=none "${WHISPER_SSH_USER}@${WHISPER_SSH_HOST}" \
+     'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys; chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys'
+   ```
+
+   如果首次连接尚未可用，直接在 Mac mini 本机编辑 `~/.ssh/authorized_keys`，再执行 `chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys`。
+3. 在 Mac mini 上检查电源设置。下面的 `sudo` 只修改接电时的睡眠和网络唤醒行为，逐项审阅后再执行：
+
+   ```bash
+   sudo pmset -c sleep 0
+   sudo pmset -c displaysleep 10
+   sudo pmset -c womp 1
+   sudo pmset -c ttyskeepawake 1
+   sudo pmset -c powernap 1
+   sudo pmset -c tcpkeepalive 1
+   pmset -g custom
+   ```
+
+   `sleep 0` 只关闭自动空闲整机睡眠，不禁止用户从苹果菜单手动睡眠；`displaysleep 10` 只关闭显示器。
+4. 可选：在 Mac mini 的 `~/.ssh/rc` 中加入一次性 UserWake 钩子，使网络 DarkWake 在首次 SSH 后提升为完整唤醒。该文件必须静默、权限为 `700`，不能向 stdout 写任何内容，否则会破坏 SFTP、VS Code 或 Codex 的 SSH 协议。
+
+   ```sh
+   #!/bin/sh
+   (
+       state_dir="$HOME/.ssh"
+       lock_dir="$state_dir/.userwake-lock"
+       state_file="$state_dir/.last-userwake-uuid"
+       if ! /bin/mkdir "$lock_dir" 2>/dev/null; then exit 0; fi
+       trap '/bin/rmdir "$lock_dir" 2>/dev/null' EXIT HUP INT TERM
+       sleep_wake_uuid=$(/usr/sbin/ioreg -r -n IOPMrootDomain -d 1 -l 2>/dev/null | /usr/bin/awk -F'"' '/"SleepWakeUUID"/ { print $4; exit }')
+       wake_reason=$(/usr/sbin/ioreg -r -n IOPMrootDomain -d 1 -l 2>/dev/null | /usr/bin/awk -F'"' '/"Wake Reason"/ { print $4; exit }')
+       last_uuid=$(/bin/cat "$state_file" 2>/dev/null || true)
+       case "$wake_reason" in
+           *enet*|*Enet*|*MagicPacket*|*Network*)
+               if [ -n "$sleep_wake_uuid" ] && [ "$sleep_wake_uuid" != "$last_uuid" ]; then
+                   temp_state="$state_file.$$"
+                   /usr/bin/printf '%s\n' "$sleep_wake_uuid" >"$temp_state" && /bin/mv -f "$temp_state" "$state_file"
+                   /usr/bin/nohup /usr/bin/caffeinate -u -s -t 20 </dev/null >/dev/null 2>&1 &
+               fi
+               ;;
+       esac
+   ) </dev/null >/dev/null 2>&1 &
+   exit 0
+   ```
+
+   保存后执行 `chmod 700 ~/.ssh/rc`。如需保持手动睡眠，先关闭会自动重连的 VS Code、Codex 或其它 SSH 客户端；否则自动重连会再次发送 WOL。
+
+### 0.3 验收 SSH/WOL
+
+```bash
+ssh -G "${WHISPER_SSH_ALIAS}" | egrep '^(hostname|user|port|identityfile|proxycommand|connecttimeout|serveralive)'
+ssh "${WHISPER_SSH_ALIAS}"
+```
+
+首次连接时确认主机密钥指纹。连接失败时检查 `dns-sd -G v4 "${WHISPER_SSH_HOST}"`、`nc -vz -w 3 "${WHISPER_SSH_HOST}" 22`、WOL 广播地址和目标 MAC；不要为了绕过主机密钥警告而删除 `known_hosts`。
+
+## 1. 手动安装和验证流程
+
+### 1.1 系统与依赖
+
+系统更新只做检查，是否安装由用户决定：
 
 ```bash
 softwareupdate --list
+./scripts/01-install-dependencies.sh
 ```
 
-系统更新可能重启，因此 `install.sh` 不会自动安装系统更新。Xcode Command Line Tools 缺失时，依赖脚本会调用 `xcode-select --install` 并要求安装完成后重跑。
-
-依赖安装：
+Homebrew 缺失时，先审阅官方安装器，再显式运行：
 
 ```bash
-./scripts/01-install-dependencies.sh
-# Homebrew 缺失时，审阅后改为：
 ./scripts/01-install-dependencies.sh --install-homebrew
 ```
 
-它使用 Apple Silicon Homebrew `/opt/homebrew/bin/brew` 安装 Git、CMake 和 FFmpeg。预检会拒绝非 macOS、非 `arm64`、Rosetta 进程、依赖缺失、磁盘不足 6 GiB和非法端口：
+Xcode Command Line Tools 缺失时，脚本会调用 `xcode-select --install` 并要求完成图形安装后重跑。
+
+### 1.2 预检、构建和模型
 
 ```bash
 ./scripts/00-preflight.sh
-```
-
-### 2. 获取并构建稳定版
-
-```bash
 ./scripts/02-build-whisper.sh
+./scripts/03-download-model.sh
 ```
 
-脚本克隆官方仓库的 `v1.9.2`，并再次核对完整 commit。构建参数为：
+构建脚本会固定 tag 和完整 commit，启用 Release、Metal、CLI 和 server。模型脚本会校验文件大小和 SHA-256；校验失败时保留文件，不会静默覆盖。
 
-```text
-CMAKE_BUILD_TYPE=Release
-GGML_METAL=ON
-WHISPER_BUILD_EXAMPLES=ON
-WHISPER_BUILD_SERVER=ON
-WHISPER_BUILD_TESTS=OFF
-```
+### 1.3 本机 CLI 和 server
 
-若专用安装目录中的源码有未提交修改，脚本会停止，不会覆盖。构建记录保存在安装根目录的 `var/state/build.txt`。
-
-### 3. 下载并验证模型，再做 CLI 转写
+有真实中文、英文音频时执行：
 
 ```bash
-./scripts/03-download-model.sh
 ./scripts/04-validate-cli.sh /path/to/chinese.m4a /path/to/english.m4a
 ```
 
-下载脚本同时校验官方模型文件的字节数和 SHA-256。若已有正式模型校验失败，脚本会保留文件并退出，不会静默覆盖。
-
-CLI 验证脚本先用 FFmpeg 把任意常见音频转成 16 kHz、单声道、16-bit WAV，再以 `--language auto` 调用 `whisper-cli`。转写和运行日志保存在：
-
-```text
-<项目根>/var/log/cli-validation/
-```
-
-不传音频时会使用 whisper.cpp 自带的英文 JFK 样本，只能证明构建、模型、FFmpeg 与推理链路可用，不能替代真实中英文验收。
-
-### 4. 启动 LAN server
-
-后台启动并等待模型加载完成：
+不传音频时会使用上游 JFK 样本，仅代表冒烟测试，不代表中英文验收完成。启动服务：
 
 ```bash
 ./scripts/05-server.sh start
-```
-
-实际命令等价于：
-
-```bash
-whisper-server \
-  --host 0.0.0.0 \
-  --port 8080 \
-  --public /absolute/path/third_party/whisper.cpp/examples/server/public \
-  --inference-path /v1/audio/transcriptions \
-  --convert \
-  --language auto \
-  --threads 4 \
-  --model /absolute/path/ggml-large-v3-turbo.bin
-```
-
-管理命令：
-
-```bash
 ./scripts/05-server.sh status
 ./scripts/05-server.sh logs
 ./scripts/05-server.sh stop
 ./scripts/05-server.sh foreground
 ```
 
-PID 和日志默认位于：
+后台服务的 PID、日志和状态分别位于 `var/run/`、`var/log/` 和 `var/state/`。当前方案没有配置 `launchd`，重启 Mac 后需要手动启动。
 
-```text
-<项目根>/var/run/whisper-server.pid
-<项目根>/var/log/whisper-server.log
-```
+### 1.4 防火墙和 LAN 验收
 
-后台模式用于完成第 4–5 步验收，不等同于开机自启。`launchd` 是原调研文档第 7 步，本安装包没有越界实现。
-
-若 macOS Application Firewall 已启用且 LAN 客户端被阻止，先只读检查：
+先只读检查 Application Firewall：
 
 ```bash
 ./scripts/06-firewall.sh
 ```
 
-确认确实被防火墙阻断后再运行 `./scripts/06-firewall.sh --apply`，把精确的 server 二进制加入允许列表。脚本只会在 `WHISPER_FIREWALL_HELPER` 指向的既有最小权限 helper 精确匹配当前 server 路径时使用它；否则会显示用途并请求交互式管理员授权。
-
-### 5. 从另一台电脑验证
-
-复制 `client/verify-server.sh` 到同一局域网的另一台电脑：
+只有本机 `/health` 正常而 LAN 客户端被防火墙阻止时，才执行：
 
 ```bash
-chmod +x verify-server.sh
-./verify-server.sh "http://${WHISPER_LAN_HOST}:8080" /path/to/audio.m4a
+./scripts/06-firewall.sh --apply
 ```
 
-在客户端执行上面的命令前，将 `WHISPER_LAN_HOST` 设置为服务端的 mDNS 主机名或 LAN IP；
-它不应写成仓库中的固定值。
+脚本只会在 `WHISPER_FIREWALL_HELPER` 精确匹配当前 server 路径时使用免密 helper，否则执行两条精确的防火墙命令并可能要求管理员密码。不要添加 `NOPASSWD: ALL`。
 
-脚本严格检查 HTTP 状态、health JSON，以及转写 JSON 中的非空 `text`。发送的 multipart 包含：
+从另一台 LAN 电脑复制 `client/verify-server.sh` 并运行：
+
+```bash
+./verify-server.sh "http://${WHISPER_LAN_HOST}:8080" /path/to/test-audio.m4a
+```
+
+验收标准：`GET /health` 返回 HTTP 200 且 `{"status":"ok"}`；转写返回 HTTP 200、合法 JSON 和非空 `text`。multipart 中的 `model=whisper-1` 只是兼容占位值，服务端模型由启动参数固定。
+
+## 服务接口和 OpenWhispr
+
+默认监听 `0.0.0.0:8080`，接口为：
 
 ```text
-file=@audio.m4a
-model=whisper-1
-response_format=json
+GET  http://127.0.0.1:8080/health
+POST http://${WHISPER_LAN_HOST}:8080/v1/audio/transcriptions
 ```
 
-`model=whisper-1` 是客户端兼容占位字段；该 server 不会根据它动态切换模型，真正模型由 server 启动参数固定。
-
-## sudo 边界
-
-正常情况下：
-
-- 构建、模型下载、CLI 验证、server 启停：不使用 sudo；
-- Xcode Command Line Tools：由 macOS 图形安装器处理；
-- Homebrew 首次安装：官方安装器可能请求一次管理员授权；
-- 安装 Homebrew 包：正常 Homebrew 权限下不使用 sudo；
-- 系统更新：可能需要管理员授权且可能重启，必须单独确认；
-- 防火墙允许项：只有匹配当前路径的最小权限 helper 才会免密执行，否则可能要求一次管理员授权。
-
-目标机的既有 helper 仍指向整理前的旧目录，因此当前目录默认不会使用它。若要更新 helper，应单独审计并只允许当前 server 的精确路径；不要添加 `NOPASSWD: ALL`。直接操作防火墙时对应的精确命令是：
+OpenWhispr 的 Base URL 填：
 
 ```text
-/usr/libexec/ApplicationFirewall/socketfilterfw --add <精确 server 路径>
-/usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp <精确 server 路径>
+http://${WHISPER_LAN_HOST}:8080/v1
 ```
 
-Homebrew 首次安装会执行多项系统目录准备操作，不适合猜测性地放宽 sudo 白名单；建议那一步人工输入一次管理员密码。
+客户端会追加 `/audio/transcriptions`，不能省略 `/v1`。`--convert` 会让 FFmpeg 处理上传文件，因此服务只应暴露在可信 LAN，不要配置公网端口转发。
 
-## 安全限制
+## 权限、安全和故障定位
 
-- 只在可信家庭或小团队 LAN 使用。
-- 不做路由器端口转发，不直接暴露到互联网。
-- 原始 server 没有 API key、TLS 或用户隔离。
-- `--convert` 会处理上传文件并调用 FFmpeg，保持 FFmpeg 和 whisper.cpp 更新。
-- server 必须以普通用户运行。
-- 本安装固定到 `v1.9.2` 以保证可复现；安全更新应先在另一个目录测试，再有意识地修改 tag、commit 和模型校验值。
+- 构建、下载模型、CLI 验证和 server 启停不需要 `sudo`；server 不应以 root 运行。
+- Homebrew 首次安装、macOS 系统设置、`pmset`、Remote Login 和 Application Firewall 可能需要管理员授权，执行前应说明具体用途。
+- WOL 魔术包没有认证；真正的登录边界是 SSH 主机密钥、公钥认证和远端账户权限。
+- 不要提交 SSH 私钥、`authorized_keys` 内容、主机密钥指纹、实际 MAC/IP、`.env`、录音、模型或日志。
+- `404 /audio/transcriptions` 通常表示 OpenWhispr Base URL 少了 `/v1`。
+- `/health` 返回 503 表示模型仍在加载，查看 `./scripts/05-server.sh logs`。
+- LAN 访问失败时检查同一子网、访客网络隔离、`WHISPER_LAN_HOST` 解析和 Application Firewall。
+- 模型 checksum 失败时保留文件并报告实际大小/SHA-256，不要绕过校验。
 
-## 故障定位
-
-- `当前 shell 不是 arm64`：退出 Rosetta 终端，使用原生 Terminal/iTerm 重新执行。
-- `port 8080 already in use`：运行 `lsof -nP -iTCP:8080 -sTCP:LISTEN`，确认占用者；不要盲目 kill。
-- OpenWhispr 报 `404 File Not Found (/audio/transcriptions)`：其“服务器 URL”应填写 `http://${WHISPER_LAN_HOST}:8080/v1`，不能省略 `/v1`。客户端会自行追加 `/audio/transcriptions`。
-- `/health` 本机成功、远程失败：检查 Mac IP、同一子网、访客网络隔离和 Application Firewall。
-- `/health` 返回 503：模型仍在加载，查看 `./scripts/05-server.sh logs`。
-- FFmpeg 转换失败：先单独运行 `ffmpeg -i <file>`，确认输入文件未损坏且格式受支持。
-- 模型 checksum 失败：保留错误文件，报告实际大小和 SHA-256；不要绕过校验。
-- 远程返回 JSON 但无 `text`：保存完整响应和 server 日志，确认请求路径和 `response_format=json`。
-
-## 交接入口和上游依据
-
-另一个对话应从 [execution-handoff.md](./docs/execution-handoff.md) 开始，并在每个验收点保留证据。
-
-上游依据：
-
-- [whisper.cpp 官方仓库](https://github.com/ggml-org/whisper.cpp)
-- [v1.9.2 server README](https://github.com/ggml-org/whisper.cpp/blob/v1.9.2/examples/server/README.md)
-- [v1.9.2 server 实现](https://github.com/ggml-org/whisper.cpp/blob/v1.9.2/examples/server/server.cpp)
-- [官方 ggml 模型仓库](https://huggingface.co/ggerganov/whisper.cpp)
-- [Homebrew 官方安装说明](https://brew.sh/)
+详细 CLI、HTTP 字段、响应格式和兼容性说明见 [whisper-cpp-server-guide.md](./docs/whisper-cpp-server-guide.md)。按需启动方案仍处于设计阶段，见 [whisper-server-on-demand-plan.md](./docs/whisper-server-on-demand-plan.md) 及对应 GitHub issue。

@@ -651,7 +651,7 @@ curl --fail --show-error \
 - [whisper-server v1.9.2 源码](https://github.com/ggml-org/whisper.cpp/blob/v1.9.2/examples/server/server.cpp)
 - [v1.9.2 模型说明](https://github.com/ggml-org/whisper.cpp/blob/v1.9.2/models/README.md)
 - [whisper.cpp v1.9.2 Release](https://github.com/ggml-org/whisper.cpp/releases/tag/v1.9.2)
-- 本项目的 [server-info.md](./server-info.md)
+- 本项目的 [README.md](../README.md)
 
 参数的最终依据始终是当前二进制帮助和对应 tag 的源码：
 
