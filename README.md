@@ -18,9 +18,6 @@
 | 防火墙脚本 | 检查或放行精确的 server 二进制 | `scripts/06-firewall.sh` |
 | LAN 客户端脚本 | 验证 `/health` 和 multipart 转写 | `client/verify-server.sh` |
 | API/参数指南 | 详细说明 whisper.cpp、HTTP API 和故障排查 | `docs/whisper-cpp-server-guide.md` |
-| 按需启动方案 | 尚未实施的网关/空闲退出设计 | `docs/whisper-server-on-demand-plan.md` |
-
-当前固定基线：`whisper.cpp v1.9.2`，commit `306c88f4d1286aec1bf96e544632897886af5501`；Release + Metal；模型 `ggml-large-v3-turbo.bin`，大小 `1624555275` bytes，SHA-256 `1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69`。
 
 ## 文件夹结构
 
@@ -265,15 +262,4 @@ http://${WHISPER_LAN_HOST}:8080/v1
 
 客户端会追加 `/audio/transcriptions`，不能省略 `/v1`。`--convert` 会让 FFmpeg 处理上传文件，因此服务只应暴露在可信 LAN，不要配置公网端口转发。
 
-## 权限、安全和故障定位
-
-- 构建、下载模型、CLI 验证和 server 启停不需要 `sudo`；server 不应以 root 运行。
-- Homebrew 首次安装、macOS 系统设置、`pmset`、Remote Login 和 Application Firewall 可能需要管理员授权，执行前应说明具体用途。
-- WOL 魔术包没有认证；真正的登录边界是 SSH 主机密钥、公钥认证和远端账户权限。
-- 不要提交 SSH 私钥、`authorized_keys` 内容、主机密钥指纹、实际 MAC/IP、`.env`、录音、模型或日志。
-- `404 /audio/transcriptions` 通常表示 OpenWhispr Base URL 少了 `/v1`。
-- `/health` 返回 503 表示模型仍在加载，查看 `./scripts/05-server.sh logs`。
-- LAN 访问失败时检查同一子网、访客网络隔离、`WHISPER_LAN_HOST` 解析和 Application Firewall。
-- 模型 checksum 失败时保留文件并报告实际大小/SHA-256，不要绕过校验。
-
-详细 CLI、HTTP 字段、响应格式和兼容性说明见 [whisper-cpp-server-guide.md](./docs/whisper-cpp-server-guide.md)。按需启动方案仍处于设计阶段，见 [whisper-server-on-demand-plan.md](./docs/whisper-server-on-demand-plan.md) 及对应 GitHub issue。
+详细 CLI、HTTP 字段、响应格式和兼容性说明见 [whisper-cpp-server-guide.md](./docs/whisper-cpp-server-guide.md)。
