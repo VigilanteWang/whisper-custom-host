@@ -40,13 +40,35 @@ http://<Mac-mini-host-or-IP>:8080/v1
 | whisper.cpp | `v1.9.2` |
 | 固定 commit | `306c88f4d1286aec1bf96e544632897886af5501` |
 | 推理模型 | `large-v3-turbo` |
-| 模型文件 | `models/ggml-large-v3-turbo.bin`，约 1.5 GiB |
+| 唯一权威模型 | `~/Library/Application Support/whisper-custom-host/runtime/models/ggml-large-v3-turbo.bin`，约 1.5 GiB |
 | LAN 网关 | `0.0.0.0:8080` |
 | 模型后端 | `127.0.0.1:18080` |
 | 默认空闲回收 | 300 秒 |
 | 外部转写路径 | `POST /v1/audio/transcriptions` |
 
 模型下载脚本会同时校验文件大小和 SHA-256；不要用未验收的模型替换固定文件。
+`scripts/03-download-model.sh` 是模型位置的唯一管理入口：它在上述 Application Support 路径下载、
+校验或迁移模型，并把 `model.txt` 写在同一个 `runtime/models/` 目录。`scripts/04-validate-cli.sh`、
+`scripts/05-server.sh` 和 `scripts/08-on-demand-service.sh` 全部使用这一份模型。
+
+仓库 `models/` 不再存放正式模型。若升级前仍存在
+`<项目根>/models/ggml-large-v3-turbo.bin`，03 脚本会分别对旧文件和新权威文件执行固定 size+SHA
+校验；只有两份都匹配后才删除旧文件。任一校验失败都会保留旧文件并停止迁移。
+
+## Issue #2 实现状态
+
+按需网关的重构已经落地并完成当前机器上的运行验收：
+
+- 原来的单文件网关已拆为 `main`、`config`、`support`、`platform_process`、
+  `backend_controller` 和 `http_gateway` 六个职责明确的模块；
+- 当前用户的 LaunchAgent 已验证可用；真实音频的冷请求、热请求、300 秒空闲回收和再次唤醒均已验证；
+- 本轮真实 JFK 已分别通过 CLI、direct HTTP 和 on-demand HTTP 三条路径；最终 on-demand 请求返回
+  HTTP 200，耗时 6.82 秒；
+- Application Firewall 只读检查显示防火墙已启用，但新的 Application Support 精确网关二进制没有
+  匹配的 allow 规则，仍需重新 apply 并完成跨机器验证；
+- T17（另一台机器的跨 LAN 验证）、注销/登录边界，以及 direct 模式正式回滚演练仍未完成。
+
+本轮不在文档中固化运行时 PID；请用服务状态和日志命令读取现场值。
 
 ## 项目内容
 
@@ -57,20 +79,59 @@ http://<Mac-mini-host-or-IP>:8080/v1
 | `scripts/00-preflight.sh` | 检查 macOS、arm64、工具链、磁盘和端口 |
 | `scripts/01-install-dependencies.sh` | 检查或安装 Homebrew、Git、CMake、FFmpeg 等依赖 |
 | `scripts/02-build-whisper.sh` | 固定 commit 构建 `whisper-cli` 和 `whisper-server`，启用 Metal |
-| `scripts/03-download-model.sh` | 下载并校验 `large-v3-turbo` |
-| `scripts/04-validate-cli.sh` | 使用 CLI 做本机音频冒烟验证 |
-| `scripts/06-firewall.sh` | 检查或放行按需网关这个精确二进制 |
-| `scripts/07-build-on-demand-gateway.sh` | 编译 C++17 按需网关 |
-| `scripts/08-on-demand-service.sh` | 管理当前用户的 LaunchAgent、状态和日志 |
-| `gateway/whisper_on_demand_gateway.cpp` | 网关源码 |
+| `scripts/03-download-model.sh` | 在唯一权威路径下载/校验模型，并安全迁移仓库旧模型 |
+| `scripts/04-validate-cli.sh` | 使用唯一权威模型做 CLI 本机音频冒烟验证 |
+| `scripts/06-firewall.sh` | 检查或放行 Application Support 中实际监听 LAN 的精确网关二进制 |
+| `scripts/07-build-on-demand-gateway.sh` | 核对 pinned commit/header，构建并全量验证 C++17 网关后原子发布 |
+| `scripts/08-on-demand-service.sh` | 原子部署最小运行时，管理当前用户 LaunchAgent、状态和日志 |
+| `gateway/main.cpp` | 进程入口、参数解析和启动错误处理 |
+| `gateway/config.h`, `gateway/config.cpp` | 配置、CLI > 环境变量 > 默认值优先级和路径重派生 |
+| `gateway/support.h`, `gateway/support.cpp` | HTTP/JSON、临时文件、bounded queue、deadline 等通用支持 |
+| `gateway/platform_process.h`, `gateway/platform_process.cpp` | macOS spawn、PID/命令行身份校验、信号和子进程回收 |
+| `gateway/backend_controller.h`, `gateway/backend_controller.cpp` | 后端状态机、RequestLease RAII、空闲回收和重启 |
+| `gateway/http_gateway.h`, `gateway/http_gateway.cpp` | 路由、流式上传暂存和后端转发 |
+| `gateway/CMakeLists.txt` | `gateway_core` 静态库、最终网关 target、CTest 和 sanitizer 配置 |
 | `launchd/com.local.whisper-on-demand-gateway.plist.in` | LaunchAgent 模板 |
 | `client/verify-server.sh` | 从另一台 LAN 电脑执行端到端验收 |
-| `tests/on-demand-integration.sh` | 使用 mock 后端测试生命周期，不加载真实模型 |
+| `tests/on-demand-integration.sh` | 使用 mock 后端在临时 loopback 端口覆盖 15 个生命周期/HTTP 场景 |
 | `docs/whisper-server-on-demand-plan.md` | 按需设计、边界和验收记录 |
 | `docs/whisper-cpp-server-guide.md` | 原生 whisper.cpp、CLI 和 whisper-server 参考说明 |
 
-生成的源码、构建产物、模型和运行时文件分别位于
-`third_party/`、`build/`、`models/` 和 `var/`，均不应提交到 Git。
+仓库内生成的源码、构建产物和 direct 模式状态分别位于 `third_party/`、`build/` 和 `var/`，均不应
+提交到 Git。仓库 `models/` 只视为旧版迁移来源，不再是正式模型目录。
+
+仓库中的审计构建产物仍位于 `build/on-demand/`；LaunchAgent 不直接从 `~/Documents` 下执行它，
+而是从验证过的 build/state 把最小可执行运行文件原子部署到
+`~/Library/Application Support/whisper-custom-host/`，与 03 脚本直接管理在该处的唯一权威模型配合。
+这样既保留可审计构建，也避开后台进程访问 Documents 时的 macOS TCC 阻塞。
+
+### 网关构建与验证
+
+构建脚本先确认 whisper.cpp 固定 commit，以及 `examples/server/httplib.h` 在该 commit 中的原始
+Git blob；原始 header 不会被修改。CMake 读取这个 pinned header，在构建目录生成 raw-reader
+compatibility header，供 multipart 原样转发使用。
+
+脚本在发布前建立隔离的 release 候选目录，并依次执行：
+
+1. CMake release 构建、CTest 和 `--help` 检查；
+2. 15 个临时 loopback 集成场景（包括定长上传早启动、chunked 超限不启动、raw multipart 保真、空闲回收和故障退避）；
+3. ASan/UBSan 构建，并再次运行 CTest 和同一组 loopback 集成场景。
+
+只有上述检查全部成功，才把候选二进制和构建状态记录通过临时文件 `rename` 原子发布到
+`build/on-demand/bin/`；检查失败不会覆盖当前可用产物。
+
+`scripts/08-on-demand-service.sh start` 会再次核对 `build/on-demand/gateway-build.txt` 中的二进制和
+header SHA，并原地校验 03 脚本管理的唯一权威模型；随后把 gateway、`whisper-server`、所需 dylib、
+pinned header、commit attestation、run 和 log 目录部署到 Application Support。08 不复制或维护第二份
+模型。部署时会把 server/dylib 的 checkout rpath 改为
+`@executable_path`/`@loader_path`，并对 gateway、server 和 dylib 重新做 ad-hoc 签名。若已有受管
+服务，只有 health 同时满足 `backend=cold` 且 active/pending 都为 0 时才允许 bootout 后重启；否则
+拒绝中断在线请求。
+
+配置解析遵循 CLI > 环境变量 > 默认值；最终 `root/source` 确定后才重派生 server、model、public、
+header、PID 和日志路径，避免改了根目录却继续使用旧路径。每个请求由 `RequestLease` RAII 对象
+登记并在所有返回路径释放 active 计数。带合法 `Content-Length` 的请求会在上传完成前启动后端以重叠模型加载；
+chunked 请求必须先完整暂存并确认没有超过限制，超限返回 413 且绝不启动后端。
 
 ## 配置
 
@@ -135,8 +196,8 @@ WHISPER_START_FAILURE_BACKOFF_SECONDS="10"
 1. 检查或安装依赖；
 2. 检查主机架构、工具链、磁盘和端口；
 3. 拉取并固定 `whisper.cpp v1.9.2`，启用 Metal、CLI 和 server；
-4. 下载并校验 `large-v3-turbo`；
-5. 运行本机 CLI 验证；
+4. 在 Application Support 唯一权威路径下载/校验 `large-v3-turbo`，或安全迁移仓库旧模型；
+5. 用同一模型运行本机 CLI 验证；
 6. 编译按需网关；
 7. 校验模型后安装并启动当前登录用户的 LaunchAgent。
 
@@ -174,14 +235,25 @@ LaunchAgent 文件为：
 ~/Library/LaunchAgents/com.local.whisper-on-demand-gateway.plist
 ```
 
-网关和后端运行文件：
+仓库中的已验证构建文件：
 
 ```text
 build/on-demand/bin/whisper-on-demand-gateway
-var/run/whisper-on-demand-gateway.pid
-var/run/whisper-on-demand-backend.pid
-var/run/uploads/                         # 临时上传文件
-var/log/whisper-on-demand-backend.log
+build/on-demand/gateway-build.txt
+```
+
+LaunchAgent 的最小运行时位于：
+
+```text
+~/Library/Application Support/whisper-custom-host/
+├── bin/                                 # gateway、whisper-server、所需 dylib
+└── runtime/
+    ├── models/ggml-large-v3-turbo.bin
+    ├── models/model.txt                   # 与模型同目录的校验状态
+    ├── whisper.cpp/examples/server/httplib.h
+    ├── whisper.cpp/.git/HEAD             # pinned commit attestation
+    ├── run/                              # gateway/backend PID、uploads
+    └── log/                              # gateway/backend 业务日志
 ```
 
 LaunchAgent 的标准输出和错误日志位于：
@@ -192,7 +264,12 @@ LaunchAgent 的标准输出和错误日志位于：
 ```
 
 `stop` 保留 LaunchAgent 文件；`uninstall` 只停止服务并删除本工具生成的 plist，不删除模型、
-源码或构建产物。LaunchAgent 属于当前登录用户，不能替代无人登录时的系统级服务。
+源码或构建产物。LaunchAgent 的安装、启动和当前登录会话内的服务状态已经验证；它仍属于当前登录用户，
+注销/登录边界尚未完成验收，不能把它当作无人登录时的系统级服务。
+
+LaunchAgent 的 `WorkingDirectory` 也是
+`~/Library/Application Support/whisper-custom-host/`。所有 ProgramArguments 使用上述运行时绝对路径，
+避免 launchd/xpcproxy 在 `~/Documents` 下执行或解析工作目录时触发 TCC 阻塞。
 
 仅需前台排障时：
 
@@ -269,19 +346,23 @@ curl --fail "http://127.0.0.1:8080/health"
 - 空闲超时后后端退出；
 - 再次请求能启动新的后端进程。
 
-真实 LAN 验收不能由本机 loopback 测试替代；音频文件应使用实际业务语言和格式。
+真实音频的冷/热请求、300 秒空闲回收和再次唤醒已在服务端验证；最终真实 JFK 音频请求返回 HTTP 200，
+耗时 6.84 秒。这不能替代 T17 的另一台机器跨 LAN 验收。音频文件应使用实际业务语言和格式。
 
 ## 防火墙、SSH 和 Wake-on-LAN
 
-只在确认本机健康、但 LAN 客户端被 macOS Application Firewall 阻止时应用规则：
+当前只读检查显示 Application Firewall 已启用，但
+`~/Library/Application Support/whisper-custom-host/bin/whisper-on-demand-gateway` 没有匹配的 allow 规则。
+运行时路径从仓库迁移到 Application Support 后，旧 checkout 二进制的规则不再等价；需要重新应用并在
+另一台 LAN 机器完成 T17：
 
 ```bash
 ./scripts/06-firewall.sh --target on-demand
 ./scripts/06-firewall.sh --target on-demand --apply
 ```
 
-`--apply` 只放行按需网关的精确路径，可能要求管理员密码；不要配置
-`NOPASSWD: ALL`。上传会触发 FFmpeg 处理，因此服务只适合可信 LAN，禁止路由器端口转发。
+`--apply` 只放行按需网关的精确路径，可能要求管理员密码；不要配置 `NOPASSWD: ALL`。上传会触发
+FFmpeg 处理，因此服务只适合可信 LAN，禁止路由器端口转发。
 
 如果需要从控制端唤醒或登录 Mac mini，可先在控制端填写 `.env` 中的 SSH/WOL 字段，然后执行：
 
@@ -324,6 +405,12 @@ LaunchAgent 仍要求目标用户会话可用，WOL 不会替代服务生命周�
 ```bash
 ./scripts/08-on-demand-service.sh start
 ```
+
+### direct 模式回滚
+
+按需网关不覆盖 `whisper-server` 二进制和模型，但 direct ↔ on-demand 的正式切换/回滚演练尚未完成。
+在演练完成前，不要把 `scripts/05-server.sh start` 当作已验证的无缝回滚路径；需要切换时先保留现场日志和
+防火墙规则，按计划文档逐项核对端口及进程身份。
 
 ## 相关文档
 

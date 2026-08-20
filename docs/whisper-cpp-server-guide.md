@@ -40,8 +40,44 @@ if [[ -f .env ]]; then source .env; else source .env.example; fi
 源码目录：  ${WHISPER_INSTALL_ROOT}/third_party/whisper.cpp
 CLI：       ${WHISPER_INSTALL_ROOT}/build/whisper.cpp/bin/whisper-cli
 Server：    ${WHISPER_INSTALL_ROOT}/build/whisper.cpp/bin/whisper-server
-模型：      ${WHISPER_INSTALL_ROOT}/models/ggml-large-v3-turbo.bin
+模型：      ${WHISPER_APP_SUPPORT_ROOT}/runtime/models/ggml-large-v3-turbo.bin
+模型状态：  ${WHISPER_APP_SUPPORT_ROOT}/runtime/models/model.txt
 ```
+
+默认 `WHISPER_APP_SUPPORT_ROOT` 为
+`~/Library/Application Support/whisper-custom-host`。因此唯一权威模型文件是：
+
+```text
+~/Library/Application Support/whisper-custom-host/runtime/models/ggml-large-v3-turbo.bin
+```
+
+`scripts/03-download-model.sh` 负责在该最终路径下载、完整校验或迁移模型，并把 `model.txt` 写在模型
+同目录。`scripts/04-validate-cli.sh`、`scripts/05-server.sh`（direct）和
+`scripts/08-on-demand-service.sh`（on-demand）全部引用同一个 `MODEL_FILE`，三种运行模式不再各自维护
+模型文件。
+
+仓库 `models/` 不再存放正式模型。若发现旧版
+`${WHISPER_INSTALL_ROOT}/models/ggml-large-v3-turbo.bin`，03 脚本会先分别校验旧文件与新权威文件；只有
+两边都匹配固定 size 和 SHA-256 才删除旧文件。任一校验失败都会保留旧文件并停止迁移。
+
+日常只需执行：
+
+```bash
+./scripts/03-download-model.sh
+```
+
+不要手工在仓库与 Application Support 之间维护两份正式模型。
+
+本轮三条真实 JFK 路径均已成功：
+
+| 路径 | 结果 |
+|---|---|
+| CLI（04） | 使用唯一权威模型生成有效 JFK 转写 |
+| direct HTTP（05） | 使用同一模型完成 JFK 转写 |
+| on-demand HTTP（08） | 使用同一模型返回 HTTP 200；最终耗时 6.82 秒 |
+
+这些是本机验收证据；Application Support gateway 的 firewall allow 仍待重新 apply，T17 跨机器验证
+仍未完成。
 
 ## 2. whisper.cpp 是什么
 
@@ -86,7 +122,7 @@ Whisper 上下文的示例程序：前者适合本机批处理，后者把推理
 
 ```bash
 "${WHISPER_INSTALL_ROOT}/build/whisper.cpp/bin/whisper-cli" \
-  --model "${WHISPER_INSTALL_ROOT}/models/ggml-large-v3-turbo.bin" \
+  --model "${WHISPER_APP_SUPPORT_ROOT}/runtime/models/ggml-large-v3-turbo.bin" \
   --language auto \
   --file /绝对路径/audio.wav
 ```
@@ -130,7 +166,7 @@ whisper-cli -m /path/to/model.bin -f input.wav --output-json-full --output-file 
 | 参数 | 默认值 | 含义与建议 |
 |---|---:|---|
 | `-f, --file FNAME` | 空 | 输入音频；也可直接使用位置参数 |
-| `-m, --model FNAME` | `models/ggml-base.en.bin` | 模型文件。实际使用时建议总是明确指定 |
+| `-m, --model FNAME` | `models/ggml-base.en.bin` | 上游二进制的相对默认值；本套件不使用它，始终明确指定唯一权威模型 |
 | `-l, --language LANG` | `en` | 输入语言；多语言场景使用 `auto`，已知中文可用 `zh` |
 | `-dl, --detect-language` | 关闭 | 只检测语言后退出 |
 | `-ng, --no-gpu` | 关闭 | 禁用 GPU；通常只用于对比或排障 |
@@ -217,8 +253,9 @@ cd "${WHISPER_INSTALL_ROOT}"
 ./scripts/05-server.sh foreground
 ```
 
-脚本优先从本地 `.env` 读取端口、线程数、模型等配置；没有 `.env` 时使用 `.env.example`。它会检查模型和 FFmpeg，后台启动后等待
-`/health` 返回正常。它比手工复制完整命令更不容易漏参数。
+脚本优先从本地 `.env` 读取端口、线程数等配置；没有 `.env` 时使用 `.env.example`。它会完整校验
+Application Support 中的唯一权威模型和 FFmpeg，后台启动后等待 `/health` 返回正常。它比手工复制
+完整命令更不容易漏参数。
 
 ### 5.2 当前等价的直接启动命令
 
@@ -231,7 +268,7 @@ cd "${WHISPER_INSTALL_ROOT}"
   --convert \
   --language "${WHISPER_LANGUAGE}" \
   --threads "${WHISPER_THREADS}" \
-  --model "${WHISPER_INSTALL_ROOT}/models/ggml-${WHISPER_MODEL}.bin"
+  --model "${WHISPER_APP_SUPPORT_ROOT}/runtime/models/ggml-${WHISPER_MODEL}.bin"
 ```
 
 模型只在服务启动时加载一次，后续请求复用它，所以 server 特别适合多个客户端反复提交短录音。
@@ -498,7 +535,8 @@ curl --fail --show-error \
 
 不建议把 `/load` 暴露给不可信客户端：当前 server 没有认证，任何能访问该路由的人都可以尝试
 让进程加载服务器上某个已存在的路径；如果新模型初始化失败，v1.9.2 的实现可能直接退出进程。
-本机日常换模型更安全的方式是修改 `.env`，然后受控重启服务。
+本机确需换模型时，应同时更新固定的模型名、size 和 SHA，运行 `03-download-model.sh` 把新模型放到
+唯一权威目录，再依次验证 CLI、direct 和 on-demand；不要让 `/load` 指向仓库里的临时模型路径。
 
 ## 12. OpenAI API 兼容性的边界
 

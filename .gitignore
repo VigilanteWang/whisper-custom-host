@@ -16,7 +16,8 @@ config.env
 
 # Editors and local tooling
 .idea/
-.vscode/
+.vscode/*
+!.vscode/c_cpp_properties.json
 *.swp
 *.swo
 *~

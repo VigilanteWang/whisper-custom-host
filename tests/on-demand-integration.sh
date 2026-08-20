@@ -12,6 +12,7 @@ GATEWAY_BIN="${ON_DEMAND_GATEWAY_BIN:-${PROJECT_ROOT}/build/on-demand/bin/whispe
 CXX="${CXX:-clang++}"
 KEEP_TEMP=0
 COMPILE_ONLY=0
+RUN_CASE_COUNT=0
 
 usage() {
   cat <<'EOF'
@@ -66,6 +67,7 @@ require_command "$CXX"
 
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/whisper-on-demand.XXXXXX")"
 TMP_ROOT="$(cd -- "${TMP_ROOT}" && pwd -P)"
+TEST_MODEL_FILE="${TMP_ROOT}/mock-model.bin"
 MOCK_BIN="${TMP_ROOT}/mock-whisper-server"
 MOCK_BIN_REAL="${MOCK_BIN}"
 RAW_MOCK_BIN="${TMP_ROOT}/mock-raw-whisper-server"
@@ -234,7 +236,9 @@ raw_chunked_post() {
   local boundary="$2"
   local epilogue_bytes="$3"
   local result_file="$4"
-  python3 - "$port" "$boundary" "$epilogue_bytes" "$result_file" <<'PY'
+  local declared_content_length="${5:-}"
+  python3 - "$port" "$boundary" "$epilogue_bytes" "$result_file" \
+    "$declared_content_length" <<'PY'
 import socket
 import sys
 
@@ -242,6 +246,7 @@ port = int(sys.argv[1])
 boundary = sys.argv[2]
 epilogue_size = int(sys.argv[3])
 result_file = sys.argv[4]
+declared_content_length = sys.argv[5]
 body = (
     f"--{boundary}\r\n"
     'Content-Disposition: form-data; name="file"; filename="sample.wav"\r\n'
@@ -253,10 +258,15 @@ for offset in range(0, len(body), 97):
     chunk = body[offset : offset + 97]
     chunks.append(f"{len(chunk):x}\r\n".encode("ascii") + chunk + b"\r\n")
 chunks.append(b"0\r\n\r\n")
+content_length_header = (
+    f"Content-Length: {declared_content_length}\r\n"
+    if declared_content_length else ""
+)
 request = (
     f"POST /v1/audio/transcriptions HTTP/1.1\r\n"
     f"Host: 127.0.0.1:{port}\r\n"
     f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
+    f"{content_length_header}"
     "Transfer-Encoding: chunked\r\n"
     "Connection: close\r\n\r\n"
 ).encode("ascii") + b"".join(chunks)
@@ -552,6 +562,12 @@ pathlib.Path(sys.argv[1]).write_bytes(b"mock-audio\n" * 128)
 PY
 }
 
+write_model_fixture() {
+  printf 'isolated mock model fixture\n' >"${TEST_MODEL_FILE}"
+  TEST_MODEL_SIZE="$(/usr/bin/stat -f '%z' "${TEST_MODEL_FILE}")"
+  TEST_MODEL_SHA256="$(/usr/bin/shasum -a 256 "${TEST_MODEL_FILE}" | /usr/bin/awk '{print $1}')"
+}
+
 start_gateway() {
   local name="$1"
   local supplied_backend_port="${2:-}"
@@ -600,11 +616,11 @@ PY
     "WHISPER_INFERENCE_PATH=/v1/audio/transcriptions"
     "WHISPER_BACKEND_INFERENCE_PATH=/v1/audio/transcriptions"
     "WHISPER_MODEL=large-v3-turbo"
-    "WHISPER_MODEL_PATH=${PROJECT_ROOT}/models/ggml-large-v3-turbo.bin"
-    "WHISPER_MODEL_FILE=${PROJECT_ROOT}/models/ggml-large-v3-turbo.bin"
+    "WHISPER_MODEL_PATH=${TEST_MODEL_FILE}"
+    "WHISPER_MODEL_FILE=${TEST_MODEL_FILE}"
     "WHISPER_COMMIT=306c88f4d1286aec1bf96e544632897886af5501"
-    "WHISPER_MODEL_SHA256=1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
-    "WHISPER_MODEL_SIZE_BYTES=1624555275"
+    "WHISPER_MODEL_SHA256=${TEST_MODEL_SHA256}"
+    "WHISPER_MODEL_SIZE_BYTES=${TEST_MODEL_SIZE}"
     "WHISPER_LANGUAGE=auto"
     "WHISPER_THREADS=1"
     "WHISPER_PUBLIC_DIR=${CASE_DIR}/public"
@@ -689,6 +705,7 @@ run_case() {
   CAPTURE_BODY_FILE=""
   CAPTURE_HEADERS_FILE=""
   printf '通过：%s\n' "$name"
+  RUN_CASE_COUNT=$((RUN_CASE_COUNT + 1))
 }
 
 maybe_run_case() {
@@ -744,6 +761,41 @@ case_single_flight_and_warm_reuse() {
   assert_clean_uploads
 }
 
+case_known_length_starts_backend_while_uploading() {
+  MAX_UPLOAD_BYTES=8192
+  start_gateway known-length-early-start
+  local body_file="${CASE_DIR}/slow-known.multipart"
+  local result_file="${CASE_DIR}/slow-known.result"
+  python3 - "$body_file" <<'PY'
+import pathlib
+import sys
+
+boundary = "known-length"
+body = (
+    f"--{boundary}\r\n"
+    'Content-Disposition: form-data; name="file"; filename="slow.wav"\r\n'
+    "Content-Type: audio/wav\r\n\r\n"
+).encode("ascii") + (b"K" * 1024) + (
+    f"\r\n--{boundary}--\r\n"
+).encode("ascii")
+pathlib.Path(sys.argv[1]).write_bytes(body)
+PY
+  slow_content_length_post "$GW_PORT" "$body_file" \
+    'multipart/form-data; boundary=known-length' 0.05 "$result_file" &
+  local upload_pid=$!
+  local deadline=$((SECONDS + 2))
+  while ((SECONDS < deadline)) && [[ "$(count_marker '^start$')" != "1" ]]; do
+    sleep 0.05
+  done
+  assert_equal 1 "$(count_marker '^start$')" \
+    '定长慢上传完成前应已启动后端'
+  wait "$upload_pid"
+  local elapsed_ms status
+  read -r elapsed_ms status <"$result_file"
+  assert_equal 200 "$status" '定长慢上传最终应成功'
+  assert_clean_uploads
+}
+
 case_active_and_queue_limit() {
   MOCK_REQUEST_DELAY_MS=1200
   MAX_PENDING_REQUESTS=1
@@ -796,6 +848,11 @@ case_chunked_epilogue_limit() {
   raw_chunked_post "$GW_PORT" chunked-limit 4096 "$result_file"
   assert_equal 413 "$(<"$result_file")" 'chunked multipart 总大小超过上限返回 413'
   assert_equal 0 "$(count_marker '^start$')" 'chunked 超限请求不应启动后端'
+
+  local te_cl_result="${CASE_DIR}/te-cl.result"
+  raw_chunked_post "$GW_PORT" te-cl-limit 4096 "$te_cl_result" 1
+  assert_equal 400 "$(<"$te_cl_result")" 'TE+CL 请求必须在读取前拒绝'
+  assert_equal 0 "$(count_marker '^start$')" 'TE+CL 超限请求不应启动后端'
   assert_clean_uploads
 }
 
@@ -1003,10 +1060,12 @@ case_client_disconnect() {
   assert_clean_uploads
 }
 
+write_model_fixture
 write_audio_fixture
 
 maybe_run_case cold-health 'cold health、路由和 CORS' case_cold_health_and_routes
 maybe_run_case single-flight 'single-flight 与 warm reuse' case_single_flight_and_warm_reuse
+maybe_run_case known-length-early-start '定长慢上传期间提前启动后端' case_known_length_starts_backend_while_uploading
 maybe_run_case active-limit 'active 保护与 429 队列限制' case_active_and_queue_limit
 maybe_run_case idle-exit 'idle exit 与二次唤醒' case_idle_exit_and_second_wake
 maybe_run_case upload-limit '413 与临时文件清理' case_limits_and_cleanup
@@ -1019,5 +1078,19 @@ maybe_run_case startup-failure '启动失败与 backoff' case_startup_failure_an
 maybe_run_case backend-crash 'backend crash' case_backend_crash
 maybe_run_case foreign-port 'foreign backend port' case_foreign_port
 maybe_run_case disconnect 'client disconnect' case_client_disconnect
+
+if [[ -n "${ON_DEMAND_TEST_CASE:-}" ]]; then
+  (( RUN_CASE_COUNT == 1 )) || {
+    printf '错误：未知或重复的 ON_DEMAND_TEST_CASE：%s\n' \
+      "${ON_DEMAND_TEST_CASE}" >&2
+    exit 2
+  }
+else
+  (( RUN_CASE_COUNT == 15 )) || {
+    printf '错误：集成测试数量不完整：实际 %s，预期 15。\n' \
+      "${RUN_CASE_COUNT}" >&2
+    exit 2
+  }
+fi
 
 printf '\n全部按需网关集成测试通过。使用的端口均为临时 loopback 端口；未触碰 8080/18080 或 LaunchAgent。\n'

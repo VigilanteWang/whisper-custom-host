@@ -15,7 +15,7 @@ usage() {
 
 默认只检查 macOS Application Firewall，不修改系统。
   --target direct       仅检查/放行 build/whisper.cpp/bin/whisper-server
-  --target on-demand    仅检查/放行 build/on-demand/bin/whisper-on-demand-gateway
+  --target on-demand    仅检查/放行 Application Support 中的服务网关二进制
   --apply               请求管理员授权后，只添加目标二进制并解除其拦截
 
 脚本不会删除旧规则、关闭防火墙或扩大既有 sudo helper 权限。

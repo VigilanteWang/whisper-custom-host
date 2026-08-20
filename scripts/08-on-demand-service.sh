@@ -72,9 +72,15 @@ run_launchctl_bounded() {
 }
 
 prepare_runtime_dirs() {
-  mkdir -p "${RUN_DIR}" "${LOG_DIR}" "${UPLOAD_DIR}" "${LAUNCHD_LOG_DIR}"
-  chmod 700 "${UPLOAD_DIR}"
-  chmod 700 "${LAUNCHD_LOG_DIR}"
+  mkdir -p "${UPLOAD_DIR}" "${GATEWAY_RUNTIME_LOG_DIR}" \
+    "${LAUNCHD_LOG_DIR}" "${GATEWAY_SERVICE_BIN_DIR}" \
+    "${MODEL_DIR}" \
+    "$(dirname "${GATEWAY_RUNTIME_HTTPLIB_HEADER}")" \
+    "${GATEWAY_RUNTIME_SOURCE_DIR}/.git"
+  chmod 700 "${GATEWAY_RUNTIME_DIR}" "${GATEWAY_RUNTIME_RUN_DIR}" \
+    "${GATEWAY_RUNTIME_LOG_DIR}" "${UPLOAD_DIR}"
+  chmod 700 "${LAUNCHD_LOG_DIR}" "${GATEWAY_SERVICE_DIR}" \
+    "${GATEWAY_SERVICE_BIN_DIR}"
   # 日志由当前普通用户创建，网关和后端不需要共享读写权限。
   touch "${GATEWAY_LOG_FILE}" "${BACKEND_LOG_FILE}" \
     "${LAUNCHD_GATEWAY_STDOUT_FILE}" "${LAUNCHD_GATEWAY_STDERR_FILE}"
@@ -86,13 +92,111 @@ assert_gateway_prerequisites() {
   require_regular_user
   [[ "${WHISPER_SERVICE_USER}" == "$(/usr/bin/id -un)" ]] ||
     die "用户 LaunchAgent 必须由当前登录用户管理（配置 WHISPER_SERVICE_USER=${WHISPER_SERVICE_USER}，当前用户=$(/usr/bin/id -un)）。"
-  [[ -x "${GATEWAY_BIN}" ]] ||
-    die "按需网关不存在或不可执行：${GATEWAY_BIN}；先运行 07-build-on-demand-gateway.sh。"
+  [[ -x "${ON_DEMAND_BUILD_GATEWAY_BIN}" ]] ||
+    die "按需网关构建产物不存在或不可执行：${ON_DEMAND_BUILD_GATEWAY_BIN}；先运行 07-build-on-demand-gateway.sh。"
   # 网关启动前重新做完整模型大小和 SHA-256 校验；不要因为冷启动成本
   # 而跳过完整性检查。源代码 commit 也必须仍是构建时审计的固定版本。
   assert_source_commit
   assert_model_valid
   prepare_runtime_dirs
+}
+
+publish_gateway_for_service() {
+  local state_file expected_sha expected_header_sha actual_sha temp_path
+  local candidate_bin_dir asset
+  state_file="${ON_DEMAND_BUILD_DIR}/gateway-build.txt"
+  [[ -f "${state_file}" ]] || die "缺少网关构建状态：${state_file}"
+  expected_sha="$(awk -F= '$1 == "binary_sha256" {print $2; exit}' "${state_file}")"
+  [[ "${expected_sha}" =~ ^[0-9a-fA-F]{64}$ ]] || \
+    die "网关构建状态缺少合法 binary_sha256：${state_file}"
+  actual_sha="$(sha256_file "${ON_DEMAND_BUILD_GATEWAY_BIN}")"
+  [[ "${actual_sha}" == "${expected_sha}" ]] || \
+    die "网关构建产物与已验证状态不一致；请重新运行 07-build-on-demand-gateway.sh。"
+  expected_header_sha="$(awk -F= '$1 == "httplib_header_sha256" {print $2; exit}' "${state_file}")"
+  [[ "${expected_header_sha}" =~ ^[0-9a-fA-F]{64}$ ]] || \
+    die "网关构建状态缺少合法 httplib_header_sha256：${state_file}"
+
+  temp_path="$(${MKtemp} "${GATEWAY_SERVICE_BIN_DIR}/.gateway.XXXXXX")" || \
+    die "无法创建服务二进制临时文件。"
+  if ! install -m 0755 "${ON_DEMAND_BUILD_GATEWAY_BIN}" "${temp_path}"; then
+    rm -f -- "${temp_path}"
+    die "无法暂存服务二进制。"
+  fi
+  # Replace the linker's transient signature with a complete ad-hoc signature
+  # before launchd opens the file.  No identity or entitlement is asserted.
+  if ! /usr/bin/codesign --force --sign - "${temp_path}" >/dev/null; then
+    rm -f -- "${temp_path}"
+    die "服务二进制 ad-hoc 签名失败。"
+  fi
+  if [[ -f "${GATEWAY_BIN}" ]]; then
+    cp -p "${GATEWAY_BIN}" "${GATEWAY_BIN}.previous.tmp" || {
+      rm -f -- "${temp_path}"
+      die "无法保留旧服务二进制。"
+    }
+  fi
+  mv -f "${temp_path}" "${GATEWAY_BIN}"
+  if [[ -f "${GATEWAY_BIN}.previous.tmp" ]]; then
+    mv -f "${GATEWAY_BIN}.previous.tmp" "${GATEWAY_BIN}.previous"
+  fi
+
+  candidate_bin_dir="$(${MKtemp} -d "${GATEWAY_SERVICE_DIR}/candidate-bin.XXXXXX")" || \
+    die "无法创建 whisper-server 候选目录。"
+  install -m 0755 "${SERVER_BIN}" "${candidate_bin_dir}/whisper-server" || {
+    rm -rf -- "${candidate_bin_dir}"
+    die "无法暂存 whisper-server。"
+  }
+  /bin/cp -pP "${BIN_DIR}/"lib*.dylib "${candidate_bin_dir}/" || {
+    rm -rf -- "${candidate_bin_dir}"
+    die "无法暂存 whisper-server 运行库。"
+  }
+  for asset in "${candidate_bin_dir}"/lib*.dylib; do
+    [[ -f "${asset}" && ! -L "${asset}" ]] || continue
+    if /usr/bin/otool -l "${asset}" | /usr/bin/grep -F \
+      "path ${BIN_DIR} " >/dev/null; then
+      /usr/bin/install_name_tool -rpath "${BIN_DIR}" @loader_path \
+        "${asset}" || {
+        rm -rf -- "${candidate_bin_dir}"
+        die "无法修正运行库 rpath：${asset}"
+      }
+    fi
+    /usr/bin/codesign --force --sign - "${asset}" >/dev/null || {
+      rm -rf -- "${candidate_bin_dir}"
+      die "运行库 ad-hoc 签名失败：${asset}"
+    }
+  done
+  /usr/bin/install_name_tool -rpath "${BIN_DIR}" @executable_path \
+    "${candidate_bin_dir}/whisper-server" || {
+    rm -rf -- "${candidate_bin_dir}"
+    die "无法修正 whisper-server rpath。"
+  }
+  /usr/bin/codesign --force --sign - \
+    "${candidate_bin_dir}/whisper-server" >/dev/null || {
+    rm -rf -- "${candidate_bin_dir}"
+    die "whisper-server ad-hoc 签名失败。"
+  }
+  for asset in "${candidate_bin_dir}"/*; do
+    mv -f "${asset}" "${GATEWAY_SERVICE_BIN_DIR}/"
+  done
+  rmdir "${candidate_bin_dir}"
+
+  temp_path="$(${MKtemp} "$(dirname "${GATEWAY_RUNTIME_HTTPLIB_HEADER}")/.httplib.XXXXXX")" || \
+    die "无法创建 httplib.h 临时文件。"
+  install -m 0600 "${SOURCE_DIR}/examples/server/httplib.h" "${temp_path}" || {
+    rm -f -- "${temp_path}"
+    die "无法复制 pinned httplib.h。"
+  }
+  [[ "$(sha256_file "${temp_path}")" == "${expected_header_sha}" ]] || {
+    rm -f -- "${temp_path}"
+    die "服务运行时 httplib.h 校验失败。"
+  }
+  mv -f "${temp_path}" "${GATEWAY_RUNTIME_HTTPLIB_HEADER}"
+
+  temp_path="$(${MKtemp} "${GATEWAY_RUNTIME_SOURCE_DIR}/.git/.HEAD.XXXXXX")" || \
+    die "无法创建 commit attestation 临时文件。"
+  printf '%s\n' "${WHISPER_COMMIT}" >"${temp_path}"
+  chmod 0600 "${temp_path}"
+  mv -f "${temp_path}" "${GATEWAY_RUNTIME_SOURCE_DIR}/.git/HEAD"
+  log "已把验证过的最小运行时原子部署到：${GATEWAY_SERVICE_DIR}"
 }
 
 build_gateway_command() {
@@ -101,12 +205,13 @@ build_gateway_command() {
     --gateway-host "${ON_DEMAND_GATEWAY_HOST}"
     --gateway-port "${WHISPER_GATEWAY_PORT}"
     --backend-port "${WHISPER_BACKEND_PORT}"
-    --backend-bin "${SERVER_BIN}"
+    --backend-bin "${GATEWAY_RUNTIME_SERVER_BIN}"
     --model "${MODEL_FILE}"
     --model-size "${WHISPER_MODEL_SIZE_BYTES}"
     --model-sha256 "${WHISPER_MODEL_SHA256}"
-    --source-dir "${SOURCE_DIR}"
+    --source-dir "${GATEWAY_RUNTIME_SOURCE_DIR}"
     --source-commit "${WHISPER_COMMIT}"
+    --httplib-header "${GATEWAY_RUNTIME_HTTPLIB_HEADER}"
     --inference-path "${WHISPER_INFERENCE_PATH}"
     --language "${WHISPER_LANGUAGE}"
     --threads "${WHISPER_THREADS}"
@@ -170,7 +275,8 @@ plist_identity_is_ours() {
   [[ "${managed}" == "${LAUNCHD_MANAGED_BY}" || \
     ( -z "${managed}" && "${managed_legacy}" == "${LAUNCHD_MANAGED_BY}" ) ]] || return 1
   plist_owner_is_current || return 1
-  [[ "${program}" == "${GATEWAY_BIN}" ]]
+  [[ "${program}" == "${GATEWAY_BIN}" || \
+     "${program}" == "${ON_DEMAND_BUILD_GATEWAY_BIN}" ]]
 }
 
 plist_belongs_to_us() {
@@ -199,7 +305,10 @@ write_plist_atomic() {
 
   escaped_label="$(xml_escape "${LAUNCHD_LABEL}")"
   escaped_managed="$(xml_escape "${LAUNCHD_MANAGED_BY}")"
-  escaped_working_directory="$(xml_escape "${PROJECT_ROOT}")"
+  # Do not give launchd a working directory under ~/Documents.  On current
+  # macOS, a child shell can block in getcwd() before exec when launched from
+  # that protected location.  All runtime paths are absolute.
+  escaped_working_directory="$(xml_escape "${GATEWAY_SERVICE_DIR}")"
   escaped_stdout="$(xml_escape "${LAUNCHD_GATEWAY_STDOUT_FILE}")"
   escaped_stderr="$(xml_escape "${LAUNCHD_GATEWAY_STDERR_FILE}")"
   exit_timeout=$((WHISPER_SHUTDOWN_TIMEOUT_SECONDS + 5))
@@ -389,6 +498,22 @@ gateway_health_is_ok() {
   [[ "${response}" == *'"status":"ok"'* ]]
 }
 
+assert_gateway_safe_to_replace() {
+  local response=""
+  if ! launchd_service_loaded && ! gateway_process_is_ready; then
+    return 0
+  fi
+  response="$(curl --silent --show-error --max-time 3 \
+    "$(gateway_health_url)" 2>/dev/null || true)"
+  [[ -n "${response}" ]] || \
+    die "旧网关仍由本工具管理但 health 不可读；拒绝盲目重启，请先排障或显式 stop。"
+  [[ "${response}" == *'"status":"ok"'* && \
+     "${response}" == *'"backend":"cold"'* && \
+     "${response}" == *'"active_requests":0'* && \
+     "${response}" == *'"pending_requests":0'* ]] || \
+    die "旧网关不是 cold/零请求状态；拒绝中断在线请求：${response}"
+}
+
 wait_for_gateway_start() {
   local deadline
   deadline=$((SECONDS + WHISPER_STARTUP_TIMEOUT_SECONDS))
@@ -416,6 +541,8 @@ report_start_failure() {
 
 install_service() {
   assert_gateway_prerequisites
+  assert_gateway_safe_to_replace
+  publish_gateway_for_service
   write_plist_atomic
 }
 
@@ -423,6 +550,8 @@ start_service() {
   require_launchctl
   assert_on_demand_port_available 1
   assert_gateway_prerequisites
+  assert_gateway_safe_to_replace
+  publish_gateway_for_service
   write_plist_atomic
   # 只 bootout 自己的 label，确保改过的 ProgramArguments 原子生效；不
   # 触碰 direct server 或任何 PID 文件指向的未知进程。
@@ -551,6 +680,7 @@ foreground_service() {
   fi
   assert_on_demand_port_available 0
   assert_gateway_prerequisites
+  publish_gateway_for_service
   build_gateway_command
   log "前台启动按需网关：$(gateway_health_url)"
   exec "${GATEWAY_COMMAND[@]}"

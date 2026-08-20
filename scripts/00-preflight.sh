@@ -19,6 +19,11 @@ check_fail() {
 }
 
 log "检查主机、工具链和安装目标"
+printf '  模型唯一权威位置：%s\n' "${MODEL_FILE}"
+if [[ -e "${LEGACY_MODEL_FILE}" || -L "${LEGACY_MODEL_FILE}" ]]; then
+  printf '  [待迁移] 发现仓库旧模型：%s（03-download-model.sh 将在安全校验后迁移）\n' \
+    "${LEGACY_MODEL_FILE}"
+fi
 
 [[ "$(uname -s)" == "Darwin" ]] && check_ok "操作系统是 macOS" || check_fail "只支持 macOS"
 [[ "$(uname -m)" == "arm64" ]] && check_ok "当前 shell 是原生 arm64" || check_fail "当前 shell 不是 arm64；退出 Rosetta/x86 终端后重试"

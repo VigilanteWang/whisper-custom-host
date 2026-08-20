@@ -50,6 +50,7 @@ WHISPER_REQUEST_TIMEOUT_SECONDS="${WHISPER_REQUEST_TIMEOUT_SECONDS:-900}"
 WHISPER_MAX_PENDING_REQUESTS="${WHISPER_MAX_PENDING_REQUESTS:-4}"
 WHISPER_MAX_UPLOAD_BYTES="${WHISPER_MAX_UPLOAD_BYTES:-268435456}"
 WHISPER_START_FAILURE_BACKOFF_SECONDS="${WHISPER_START_FAILURE_BACKOFF_SECONDS:-10}"
+WHISPER_APP_SUPPORT_ROOT="${WHISPER_APP_SUPPORT_ROOT:-${HOME}/Library/Application Support/whisper-custom-host}"
 
 # 这些值用于 LAN 地址展示、防火墙 helper 和未来 launchd 配置；对旧版 .env
 # 保持运行时默认值，避免用户必须手工补齐新配置项。
@@ -75,8 +76,12 @@ WHISPER_WOL_SEND_COUNT="${WHISPER_WOL_SEND_COUNT:-5}"
 SOURCE_DIR="${WHISPER_INSTALL_ROOT}/third_party/whisper.cpp"
 BUILD_DIR="${WHISPER_INSTALL_ROOT}/build/whisper.cpp"
 BIN_DIR="${BUILD_DIR}/bin"
-MODEL_DIR="${WHISPER_INSTALL_ROOT}/models"
+GATEWAY_SERVICE_DIR="${WHISPER_APP_SUPPORT_ROOT}"
+GATEWAY_RUNTIME_DIR="${GATEWAY_SERVICE_DIR}/runtime"
+MODEL_DIR="${GATEWAY_RUNTIME_DIR}/models"
 MODEL_FILE="${MODEL_DIR}/ggml-${WHISPER_MODEL}.bin"
+MODEL_STATE_FILE="${MODEL_DIR}/model.txt"
+LEGACY_MODEL_FILE="${WHISPER_INSTALL_ROOT}/models/ggml-${WHISPER_MODEL}.bin"
 STATE_DIR="${WHISPER_INSTALL_ROOT}/var/state"
 LOG_DIR="${WHISPER_INSTALL_ROOT}/var/log"
 RUN_DIR="${WHISPER_INSTALL_ROOT}/var/run"
@@ -85,18 +90,29 @@ CLI_BIN="${BIN_DIR}/whisper-cli"
 SERVER_PID_FILE="${RUN_DIR}/whisper-server.pid"
 SERVER_LOG_FILE="${LOG_DIR}/whisper-server.log"
 
-# 按需模式的所有产物集中在当前仓库的 build/on-demand、var/run 和 var/log
-# 下。不要恢复旧文档中已经删除的顶层 bin/ 或其他安装路径。
+# 仓库保存可审计构建产物；LaunchAgent 的最小运行时副本放在用户
+# Application Support，避免后台进程触发 ~/Documents 的 TCC 阻塞。
 ON_DEMAND_BUILD_DIR="${WHISPER_INSTALL_ROOT}/build/on-demand"
 ON_DEMAND_BIN_DIR="${ON_DEMAND_BUILD_DIR}/bin"
-GATEWAY_BIN="${ON_DEMAND_BIN_DIR}/whisper-on-demand-gateway"
-GATEWAY_PID_FILE="${RUN_DIR}/whisper-on-demand-gateway.pid"
-BACKEND_PID_FILE="${RUN_DIR}/whisper-on-demand-backend.pid"
-UPLOAD_DIR="${RUN_DIR}/uploads"
-GATEWAY_LOG_FILE="${LOG_DIR}/whisper-on-demand-gateway.log"
-BACKEND_LOG_FILE="${LOG_DIR}/whisper-on-demand-backend.log"
+ON_DEMAND_BUILD_GATEWAY_BIN="${ON_DEMAND_BIN_DIR}/whisper-on-demand-gateway"
+# LaunchAgents can stall in dyld before main() when a newly replaced Mach-O is
+# opened from macOS-protected ~/Documents.  Keep the audited build artifact in
+# the checkout, but execute a verified copy from the user's Application Support.
+GATEWAY_SERVICE_BIN_DIR="${GATEWAY_SERVICE_DIR}/bin"
+GATEWAY_RUNTIME_SOURCE_DIR="${GATEWAY_RUNTIME_DIR}/whisper.cpp"
+GATEWAY_RUNTIME_SERVER_BIN="${GATEWAY_SERVICE_BIN_DIR}/whisper-server"
+GATEWAY_RUNTIME_MODEL_FILE="${MODEL_FILE}"
+GATEWAY_RUNTIME_HTTPLIB_HEADER="${GATEWAY_RUNTIME_SOURCE_DIR}/examples/server/httplib.h"
+GATEWAY_RUNTIME_RUN_DIR="${GATEWAY_RUNTIME_DIR}/run"
+GATEWAY_RUNTIME_LOG_DIR="${GATEWAY_RUNTIME_DIR}/log"
+GATEWAY_BIN="${GATEWAY_SERVICE_BIN_DIR}/whisper-on-demand-gateway"
+GATEWAY_PID_FILE="${GATEWAY_RUNTIME_RUN_DIR}/whisper-on-demand-gateway.pid"
+BACKEND_PID_FILE="${GATEWAY_RUNTIME_RUN_DIR}/whisper-on-demand-backend.pid"
+UPLOAD_DIR="${GATEWAY_RUNTIME_RUN_DIR}/uploads"
+GATEWAY_LOG_FILE="${GATEWAY_RUNTIME_LOG_DIR}/whisper-on-demand-gateway.log"
+BACKEND_LOG_FILE="${GATEWAY_RUNTIME_LOG_DIR}/whisper-on-demand-backend.log"
 # 语义化别名，供构建/测试脚本引用；实际路径只有上面这组单一来源。
-ON_DEMAND_GATEWAY_BIN="${GATEWAY_BIN}"
+ON_DEMAND_GATEWAY_BIN="${ON_DEMAND_BUILD_GATEWAY_BIN}"
 ON_DEMAND_GATEWAY_PID_FILE="${GATEWAY_PID_FILE}"
 ON_DEMAND_BACKEND_PID_FILE="${BACKEND_PID_FILE}"
 ON_DEMAND_UPLOAD_DIR="${UPLOAD_DIR}"
@@ -107,9 +123,8 @@ LAUNCHD_MANAGED_BY="whisper-custom-host/08-on-demand-service.sh"
 LAUNCHD_MANAGED_ENV_KEY="WHISPER_CUSTOM_HOST_MANAGED_BY"
 LAUNCHD_DIR="${WHISPER_INSTALL_ROOT}/launchd"
 LAUNCHD_PLIST_FILE="${HOME}/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
-# macOS launchd 可能因用户隐私策略拒绝打开 ~/Documents 下的 Standard*Path，
-# 即使当前用户本身可写该文件；LaunchAgent 自身日志放在用户 Library Logs，
-# 网关/后端业务日志仍按各自的 var/log 配置保留。
+# LaunchAgent 自身日志也放在用户 Library Logs，避免后台 xpcproxy 访问
+# ~/Documents 下的 Standard*Path。
 LAUNCHD_LOG_DIR="${HOME}/Library/Logs/whisper-custom-host"
 LAUNCHD_GATEWAY_STDOUT_FILE="${LAUNCHD_LOG_DIR}/whisper-on-demand-gateway.stdout.log"
 LAUNCHD_GATEWAY_STDERR_FILE="${LAUNCHD_LOG_DIR}/whisper-on-demand-gateway.stderr.log"
@@ -182,6 +197,8 @@ validate_host_value() {
 validate_configuration() {
   [[ "${WHISPER_INSTALL_ROOT}" == /* ]] ||
     die "WHISPER_INSTALL_ROOT 必须是绝对路径：${WHISPER_INSTALL_ROOT}"
+  [[ "${WHISPER_APP_SUPPORT_ROOT}" == /* ]] ||
+    die "WHISPER_APP_SUPPORT_ROOT 必须是绝对路径：${WHISPER_APP_SUPPORT_ROOT}"
   validate_host_value WHISPER_HOST "${WHISPER_HOST}"
   validate_port_value WHISPER_PORT "${WHISPER_PORT}"
   validate_port_value WHISPER_GATEWAY_PORT "${WHISPER_GATEWAY_PORT}"
@@ -224,16 +241,30 @@ file_size_bytes() {
 }
 
 assert_model_valid() {
-  [[ -f "${MODEL_FILE}" ]] || die "模型不存在：${MODEL_FILE}；先运行 03-download-model.sh。"
+  assert_model_file_valid "${MODEL_FILE}"
+  [[ ! -L "${MODEL_FILE}" ]] || die "权威模型不能是符号链接：${MODEL_FILE}"
 
-  local actual_size actual_hash
-  actual_size="$(file_size_bytes "${MODEL_FILE}")"
+  local owner mode mode_value
+  owner="$(/usr/bin/stat -f '%u' "${MODEL_FILE}")"
+  [[ "${owner}" == "$(/usr/bin/id -u)" ]] || \
+    die "权威模型不属于当前用户：${MODEL_FILE}"
+  mode="$(/usr/bin/stat -f '%Lp' "${MODEL_FILE}")"
+  mode_value=$((8#${mode}))
+  (( (mode_value & 077) == 0 )) || \
+    die "权威模型不能允许组或其他用户访问：${MODEL_FILE} mode=${mode}"
+}
+
+assert_model_file_valid() {
+  local model_path="$1" actual_size actual_hash
+  [[ -f "${model_path}" ]] || die "模型不存在：${model_path}；先运行 03-download-model.sh。"
+
+  actual_size="$(file_size_bytes "${model_path}")"
   [[ "${actual_size}" == "${WHISPER_MODEL_SIZE_BYTES}" ]] || \
-    die "模型大小不符：实际 ${actual_size}，预期 ${WHISPER_MODEL_SIZE_BYTES}。"
+    die "模型大小不符：${model_path} 实际 ${actual_size}，预期 ${WHISPER_MODEL_SIZE_BYTES}。"
 
-  actual_hash="$(sha256_file "${MODEL_FILE}")"
+  actual_hash="$(sha256_file "${model_path}")"
   [[ "${actual_hash}" == "${WHISPER_MODEL_SHA256}" ]] || \
-    die "模型 SHA-256 不符：${actual_hash}"
+    die "模型 SHA-256 不符：${model_path} 实际 ${actual_hash}"
 }
 
 health_url() {
@@ -287,7 +318,9 @@ pid_is_our_server() {
   command="$(process_command_line "${pid}" || true)"
   command_has_exact_argument_pair "${command}" --host "${WHISPER_HOST}" || return 1
   command_has_exact_argument_pair "${command}" --port "${WHISPER_PORT}" || return 1
-  command_has_exact_argument_pair "${command}" --model "${MODEL_FILE}" || return 1
+  if ! command_has_exact_argument_pair "${command}" --model "${MODEL_FILE}"; then
+    command_has_exact_argument_pair "${command}" --model "${LEGACY_MODEL_FILE}" || return 1
+  fi
   command_has_exact_argument_pair "${command}" --inference-path "${WHISPER_INFERENCE_PATH}" || return 1
 }
 
@@ -295,12 +328,19 @@ pid_is_our_gateway() {
   local pid="$1" command
   [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
   kill -0 "${pid}" 2>/dev/null || return 1
-  process_executable_matches "${pid}" "${GATEWAY_BIN}" || return 1
+  if ! process_executable_matches "${pid}" "${GATEWAY_BIN}"; then
+    # Upgrade compatibility for a still-running pre-Issue-#2 LaunchAgent.
+    process_executable_matches "${pid}" "${ON_DEMAND_BUILD_GATEWAY_BIN}" || return 1
+  fi
   command="$(process_command_line "${pid}" || true)"
   command_has_exact_argument_pair "${command}" --gateway-host "${ON_DEMAND_GATEWAY_HOST}" || return 1
   command_has_exact_argument_pair "${command}" --gateway-port "${WHISPER_GATEWAY_PORT}" || return 1
   command_has_exact_argument_pair "${command}" --backend-port "${WHISPER_BACKEND_PORT}" || return 1
-  command_has_exact_argument_pair "${command}" --model "${MODEL_FILE}" || return 1
+  if ! command_has_exact_argument_pair "${command}" --model "${MODEL_FILE}"; then
+    # Upgrade compatibility for a pre-migration gateway still using the
+    # checkout model path.
+    command_has_exact_argument_pair "${command}" --model "${LEGACY_MODEL_FILE}" || return 1
+  fi
   command_has_exact_argument_pair "${command}" --inference-path "${WHISPER_INFERENCE_PATH}" || return 1
 }
 
