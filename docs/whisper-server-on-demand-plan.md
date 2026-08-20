@@ -2,12 +2,12 @@
 
 ## 1. 文档状态
 
-- 状态：设计完成，尚未实施。
-- 编写日期：2026-08-17。
+- 状态：代码和管理入口已落地；正式 LaunchAgent、真实音频、T17 和防火墙验收待执行。
+- 更新日期：2026-08-19。
 - 适用基线：当前安装套件中的 `whisper.cpp v1.9.2`，commit
   `306c88f4d1286aec1bf96e544632897886af5501`。
 - 目标机器：Apple Silicon Mac mini，服务仅供可信局域网使用。
-- 本计划只描述后续改造与验收，不代表按需服务已经安装或验证。
+- 本文现在同时记录当前实现、验收命令和未完成边界；未列为“通过”的项目不代表已经安装或验证。
 
 文中的 LAN 主机名/IP 和 macOS 用户均为部署时配置，不在仓库中固化：使用 `.env` 的
 `WHISPER_LAN_HOST` 和 `WHISPER_SERVICE_USER`，前者默认动态读取当前主机名，后者默认当前登录用户。
@@ -96,8 +96,8 @@ http://${WHISPER_LAN_HOST}:8080/v1
 `examples/server/httplib.h`：
 
 - 使用现有 Command Line Tools 的 `clang++` 构建，不增加 Go、Node 或 Python 包依赖；
-- 输出独立 Mach-O 文件，例如
-  `<项目根>/bin/whisper-on-demand-gateway`；
+- 输出独立 Mach-O 文件：
+  `<项目根>/build/on-demand/bin/whisper-on-demand-gateway`；
 - macOS Application Firewall 可以只允许这个精确二进制，不必放行通用的 Python 解释器；
 - 不修改 `whisper.cpp` 源码和现有 `whisper-server` 二进制，便于回滚和升级时重新审计。
 
@@ -275,7 +275,9 @@ WHISPER_IDLE_TIMEOUT_SECONDS=300
 - `KeepAlive=true`，确保轻量网关崩溃后由 launchd 拉起；
 - `ProcessType=Background`；
 - `ThrottleInterval=10`，防止配置错误时高速重启；
-- stdout/stderr 写入安装根目录的日志文件；
+- stdout/stderr 写入用户 Library Logs，而不是项目目录：
+  `~/Library/Logs/whisper-custom-host/whisper-on-demand-gateway.stdout.log` 和
+  `~/Library/Logs/whisper-custom-host/whisper-on-demand-gateway.stderr.log`；
 - 不设置 root，也不在 plist 中放秘密信息。
 
 LaunchAgent 只保证该用户登录后的服务。若要求“机器重启且无人登录也能接 call”，需要第二阶段改成
@@ -298,13 +300,12 @@ LaunchAgent 只保证该用户登录后的服务。若要求“机器重启且�
 在 `.env` 增加：
 
 ```bash
-WHISPER_GATEWAY_HOST="0.0.0.0"
 WHISPER_GATEWAY_PORT="8080"
-WHISPER_BACKEND_HOST="127.0.0.1"
 WHISPER_BACKEND_PORT="18080"
 WHISPER_IDLE_TIMEOUT_SECONDS="300"
 WHISPER_STARTUP_TIMEOUT_SECONDS="180"
 WHISPER_SHUTDOWN_TIMEOUT_SECONDS="15"
+WHISPER_REQUEST_TIMEOUT_SECONDS="900"
 WHISPER_MAX_PENDING_REQUESTS="4"
 WHISPER_MAX_UPLOAD_BYTES="268435456"
 WHISPER_START_FAILURE_BACKOFF_SECONDS="10"
@@ -313,7 +314,8 @@ WHISPER_START_FAILURE_BACKOFF_SECONDS="10"
 兼容处理：
 
 - 现有 `WHISPER_HOST`、`WHISPER_PORT` 在迁移期保留，明确标注为“直接运行模式”；
-- 公网关端口仍为 8080；后端绝不能从配置中接受 `0.0.0.0`；
+- 按需网关固定绑定 `0.0.0.0`，后端固定绑定 `127.0.0.1`；这两个 host 不进入 `.env`，后端绝不能从配置中接受 `0.0.0.0`；
+- `WHISPER_GATEWAY_PORT` 和 `WHISPER_BACKEND_PORT` 仍可在 `.env` 中调整，以便避让本机端口冲突；
 - 所有秒数、端口、字节数和队列数在启动前做严格整数与范围校验；
 - 网关启动前继续调用模型大小和 SHA-256 校验，不允许为了缩短冷启动而绕过模型完整性检查；
 - 完整 SHA-256 不应在每次 call 上重算，只在安装、显式验证或网关首次启动时执行。
@@ -324,11 +326,12 @@ WHISPER_START_FAILURE_BACKOFF_SECONDS="10"
 
 | 文件 | 用途 |
 |---|---|
-| `gateway/whisper-on-demand-gateway.cpp` | 网关、状态机、上传暂存、反向代理和子进程管理 |
+| `gateway/whisper_on_demand_gateway.cpp` | 网关、状态机、上传暂存、反向代理和子进程管理 |
 | `scripts/07-build-on-demand-gateway.sh` | 核对 commit 并用 clang++ 构建网关 |
 | `scripts/08-on-demand-service.sh` | install/start/status/logs/stop/uninstall 管理入口 |
 | `launchd/com.local.whisper-on-demand-gateway.plist.in` | LaunchAgent 模板 |
 | `tests/on-demand-integration.sh` | 冷启动、热请求、空闲退出、并发和故障测试 |
+| `tests/mock-whisper-server.cc` | 接受生产固定参数的无模型 mock 后端；支持启动/ready/请求延迟、崩溃和标记日志 |
 
 计划修改：
 
@@ -342,7 +345,7 @@ WHISPER_START_FAILURE_BACKOFF_SECONDS="10"
 | `install.sh` | 增加显式 `--on-demand` 安装入口；第一版不静默改变默认运行模式 |
 | `README.md` | 增加部署、日常管理、冷启动预期和回滚入口 |
 | `README.md` | 增加逐阶段证据、日常管理和不得误报完成的要求 |
-| `docs/whisper-cpp-server-guide.md` | 更新实际 PID、端口、launchd 和日志信息 |
+| `docs/whisper-cpp-server-guide.md` | 更新实际 PID、端口、LaunchAgent 和日志信息 |
 | `docs/whisper-cpp-server-guide.md` | 说明网关 health/ready 语义与 direct/on-demand 两种模式 |
 
 不得直接覆盖当前脚本行为后再测试。先增加独立入口，在验收全部通过后才把按需模式标记为推荐。
@@ -370,11 +373,18 @@ WHISPER_START_FAILURE_BACKOFF_SECONDS="10"
 建议日志路径：
 
 ```text
-<项目根>/var/log/whisper-on-demand-gateway.log
-<项目根>/var/log/whisper-server.log
-<项目根>/var/run/whisper-server-backend.pid
+~/Library/Logs/whisper-custom-host/whisper-on-demand-gateway.stdout.log
+~/Library/Logs/whisper-custom-host/whisper-on-demand-gateway.stderr.log
+<项目根>/var/log/whisper-on-demand-backend.log
 <项目根>/var/run/whisper-on-demand-gateway.pid
+<项目根>/var/run/whisper-on-demand-backend.pid
+<项目根>/var/run/uploads/
 ```
+
+LaunchAgent 的 stdout/stderr 使用用户 `Library/Logs` 是当前正式实现的 macOS 兼容性要求：xpcproxy/TCC
+实测会拒绝 LaunchAgent 将 `StandardOutPath`/`StandardErrorPath` 指向 `~/Documents` 下的项目目录，即使
+当前用户可写。后端由网关通过 `--backend-log-file` 写入项目的
+`var/log/whisper-on-demand-backend.log`；PID 和上传临时文件仍保留在项目 `var/run/`。
 
 每次状态变化写一行带时间戳的结构化日志，至少包含：
 
@@ -524,3 +534,49 @@ curl --fail --show-error --max-time 900 \
 
 如果缺少远程机器、真实音频或管理员防火墙授权，只能报告本机已完成的阶段，不得把对应验收项写成
 通过。
+
+## 19. 当前实现证据与待集成点（2026-08-19）
+
+当前仓库已经包含以下实际入口和目录：
+
+- `gateway/whisper_on_demand_gateway.cpp` 与 `scripts/07-build-on-demand-gateway.sh`：网关源码和固定
+  `httplib.h` 的 C++17 构建入口，产物目标为 `build/on-demand/bin/whisper-on-demand-gateway`；
+- `scripts/08-on-demand-service.sh` 与 `launchd/com.local.whisper-on-demand-gateway.plist.in`：当前登录
+  用户的 `~/Library/LaunchAgents/com.local.whisper-on-demand-gateway.plist` 管理，不实现第一阶段
+  LaunchDaemon；
+- `tests/mock-whisper-server.cc`：接受网关固定的 `--host/--port/--public/--inference-path/--convert/--language/--threads/--model`
+  参数，并通过 `MOCK_*` 或 `--mock-*` 注入启动延迟、ready 延迟、请求延迟、崩溃和事件标记；
+- `tests/on-demand-integration.sh`：只使用内核分配的 loopback 临时端口和 `mktemp` 目录，明确拒绝
+  8080/18080，不调用 `launchctl`，覆盖 cold health、single-flight、active/429、warm reuse、idle/二次唤醒、
+  health neutrality、413、startup backoff、backend crash、foreign port、client disconnect、CORS、404 和
+  遗留临时文件清理；
+- `client/verify-server.sh`：原来的两个位置参数仍可用，并新增
+  `--on-demand --idle-timeout SECONDS`，用于另一台 LAN 机器的 cold/ready/计时/idle/二次唤醒验收。
+
+已执行的静态检查：
+
+```bash
+bash -n tests/on-demand-integration.sh
+bash -n client/verify-server.sh
+clang++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -pthread \
+  -I third_party/whisper.cpp/examples/server \
+  tests/mock-whisper-server.cc -o /tmp/mock-whisper-server
+```
+
+上述 fixture 编译和语法检查通过。曾使用临时编译的网关和随机 loopback 端口运行集成测试；cold
+health/路由/CORS、single-flight/warm reuse、active/429 已观察到通过。测试在 idle exit 场景停止，
+没有把整套测试报告为通过：当前网关在 macOS 上阻塞生命周期信号后，`posix_spawn` 子进程继承该信号
+屏蔽；fixture 已用 `sigwait` 兼容测试，但网关仍需在子进程启动时重置 signal mask。此外，后端正常
+退出后网关尚未及时 `waitpid` 回收 zombie，状态会卡在 `stopping`，因此 T06/T08 和后续场景需根任务
+修正网关后重新运行。测试失败时已终止测试脚本、临时网关和 fixture，不保留生产监听。
+
+尚未在本轮自动化中声称通过的项目：
+
+- 正式 `scripts/08-on-demand-service.sh start`/LaunchAgent 崩溃恢复和登录边界；
+- 使用真实 `large-v3-turbo` 音频的冷/热请求、RSS 释放和 300 秒 idle；
+- 另一台 LAN 机器的 T17、Application Firewall 精确放行以及任何需要 sudo 的管理员动作；
+- direct ↔ on-demand 正式端口切换与回滚演练。
+
+因此 OpenWhispr 仍应使用 self-hosted Base URL
+`http://${WHISPER_LAN_HOST}:${WHISPER_GATEWAY_PORT}/v1`、兼容模型值 `whisper-1`；SSH/WOL 只负责主机
+唤醒/登录，与网关和按需后端独立。服务只面向可信 LAN，未完成项不能被交接文字省略或写成已验收。

@@ -35,6 +35,22 @@ source "${CONFIG_FILE}"
 : "${WHISPER_LANGUAGE:?配置缺少 WHISPER_LANGUAGE}"
 : "${WHISPER_THREADS:?配置缺少 WHISPER_THREADS}"
 
+# 按需网关配置。旧版 .env 只包含 direct 模式的 WHISPER_HOST/WHISPER_PORT
+# 时，按需模式使用独立的计划默认端口，不改变 direct 的旧行为，也不把
+# 默认值写回 .env。网络拓扑不是用户配置：网关必须服务 LAN，后端必须留在
+# loopback，避免把 whisper-server 管理接口暴露给局域网。
+ON_DEMAND_GATEWAY_HOST="0.0.0.0"
+ON_DEMAND_BACKEND_HOST="127.0.0.1"
+WHISPER_GATEWAY_PORT="${WHISPER_GATEWAY_PORT:-8080}"
+WHISPER_BACKEND_PORT="${WHISPER_BACKEND_PORT:-18080}"
+WHISPER_IDLE_TIMEOUT_SECONDS="${WHISPER_IDLE_TIMEOUT_SECONDS:-300}"
+WHISPER_STARTUP_TIMEOUT_SECONDS="${WHISPER_STARTUP_TIMEOUT_SECONDS:-180}"
+WHISPER_SHUTDOWN_TIMEOUT_SECONDS="${WHISPER_SHUTDOWN_TIMEOUT_SECONDS:-15}"
+WHISPER_REQUEST_TIMEOUT_SECONDS="${WHISPER_REQUEST_TIMEOUT_SECONDS:-900}"
+WHISPER_MAX_PENDING_REQUESTS="${WHISPER_MAX_PENDING_REQUESTS:-4}"
+WHISPER_MAX_UPLOAD_BYTES="${WHISPER_MAX_UPLOAD_BYTES:-268435456}"
+WHISPER_START_FAILURE_BACKOFF_SECONDS="${WHISPER_START_FAILURE_BACKOFF_SECONDS:-10}"
+
 # 这些值用于 LAN 地址展示、防火墙 helper 和未来 launchd 配置；对旧版 .env
 # 保持运行时默认值，避免用户必须手工补齐新配置项。
 WHISPER_LAN_HOST="${WHISPER_LAN_HOST:-$(/usr/sbin/scutil --get LocalHostName 2>/dev/null || /bin/hostname -s)}"
@@ -69,6 +85,35 @@ CLI_BIN="${BIN_DIR}/whisper-cli"
 SERVER_PID_FILE="${RUN_DIR}/whisper-server.pid"
 SERVER_LOG_FILE="${LOG_DIR}/whisper-server.log"
 
+# 按需模式的所有产物集中在当前仓库的 build/on-demand、var/run 和 var/log
+# 下。不要恢复旧文档中已经删除的顶层 bin/ 或其他安装路径。
+ON_DEMAND_BUILD_DIR="${WHISPER_INSTALL_ROOT}/build/on-demand"
+ON_DEMAND_BIN_DIR="${ON_DEMAND_BUILD_DIR}/bin"
+GATEWAY_BIN="${ON_DEMAND_BIN_DIR}/whisper-on-demand-gateway"
+GATEWAY_PID_FILE="${RUN_DIR}/whisper-on-demand-gateway.pid"
+BACKEND_PID_FILE="${RUN_DIR}/whisper-on-demand-backend.pid"
+UPLOAD_DIR="${RUN_DIR}/uploads"
+GATEWAY_LOG_FILE="${LOG_DIR}/whisper-on-demand-gateway.log"
+BACKEND_LOG_FILE="${LOG_DIR}/whisper-on-demand-backend.log"
+# 语义化别名，供构建/测试脚本引用；实际路径只有上面这组单一来源。
+ON_DEMAND_GATEWAY_BIN="${GATEWAY_BIN}"
+ON_DEMAND_GATEWAY_PID_FILE="${GATEWAY_PID_FILE}"
+ON_DEMAND_BACKEND_PID_FILE="${BACKEND_PID_FILE}"
+ON_DEMAND_UPLOAD_DIR="${UPLOAD_DIR}"
+ON_DEMAND_GATEWAY_LOG_FILE="${GATEWAY_LOG_FILE}"
+ON_DEMAND_BACKEND_LOG_FILE="${BACKEND_LOG_FILE}"
+LAUNCHD_LABEL="com.local.whisper-on-demand-gateway"
+LAUNCHD_MANAGED_BY="whisper-custom-host/08-on-demand-service.sh"
+LAUNCHD_MANAGED_ENV_KEY="WHISPER_CUSTOM_HOST_MANAGED_BY"
+LAUNCHD_DIR="${WHISPER_INSTALL_ROOT}/launchd"
+LAUNCHD_PLIST_FILE="${HOME}/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+# macOS launchd 可能因用户隐私策略拒绝打开 ~/Documents 下的 Standard*Path，
+# 即使当前用户本身可写该文件；LaunchAgent 自身日志放在用户 Library Logs，
+# 网关/后端业务日志仍按各自的 var/log 配置保留。
+LAUNCHD_LOG_DIR="${HOME}/Library/Logs/whisper-custom-host"
+LAUNCHD_GATEWAY_STDOUT_FILE="${LAUNCHD_LOG_DIR}/whisper-on-demand-gateway.stdout.log"
+LAUNCHD_GATEWAY_STDERR_FILE="${LAUNCHD_LOG_DIR}/whisper-on-demand-gateway.stderr.log"
+
 if [[ -x /opt/homebrew/bin/brew ]]; then
   export PATH="/opt/homebrew/bin:${PATH}"
 fi
@@ -84,6 +129,82 @@ warn() {
 die() {
   printf '错误：%s\n' "$*" >&2
   exit 1
+}
+
+is_decimal_integer() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+validate_integer_range() {
+  local name="$1" value="$2" minimum="$3" maximum="$4" numeric
+  is_decimal_integer "${value}" || die "${name} 必须是十进制非负整数：${value}"
+  numeric=$((10#${value}))
+  (( numeric >= minimum && numeric <= maximum )) ||
+    die "${name} 超出范围：${value}（允许 ${minimum}-${maximum}）。"
+}
+
+validate_port_value() {
+  validate_integer_range "$1" "$2" 1 65535
+}
+
+validate_host_value() {
+  local name="$1" host="$2"
+  [[ -n "${host}" ]] || die "${name} 不能为空。"
+  [[ "${host}" != *[[:space:]/\\]* ]] || die "${name} 含有非法空白或路径字符：${host}"
+
+  # 允许常见 IPv4 地址。逐段校验可以拒绝 999.1.1.1 等会被系统解析器
+  # 以非预期方式解释的值。
+  if [[ "${host}" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+    local old_ifs="${IFS}" octet
+    IFS='.' read -r -a octets <<< "${host}"
+    IFS="${old_ifs}"
+    for octet in "${octets[@]}"; do
+      validate_integer_range "${name} IPv4 段" "${octet}" 0 255
+    done
+    return 0
+  fi
+
+  # 不接受 IPv6 或带端口的 host；网关协议和 launchd 参数均使用独立的
+  # host/port 字段，避免把 [::1]:8080 当作一个 host 传下去。
+  [[ "${#host}" -le 253 && "${host}" != .* && "${host}" != *..* ]] ||
+    die "${name} 不是合法主机名或 IPv4 地址：${host}"
+  local label
+  local old_ifs="${IFS}"
+  IFS='.' read -r -a host_labels <<< "${host}"
+  IFS="${old_ifs}"
+  for label in "${host_labels[@]}"; do
+    [[ "${#label}" -le 63 && "${label}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] ||
+      die "${name} 不是合法主机名或 IPv4 地址：${host}"
+  done
+  return 0
+}
+
+validate_configuration() {
+  [[ "${WHISPER_INSTALL_ROOT}" == /* ]] ||
+    die "WHISPER_INSTALL_ROOT 必须是绝对路径：${WHISPER_INSTALL_ROOT}"
+  validate_host_value WHISPER_HOST "${WHISPER_HOST}"
+  validate_port_value WHISPER_PORT "${WHISPER_PORT}"
+  validate_port_value WHISPER_GATEWAY_PORT "${WHISPER_GATEWAY_PORT}"
+  validate_port_value WHISPER_BACKEND_PORT "${WHISPER_BACKEND_PORT}"
+  [[ "${WHISPER_GATEWAY_PORT}" != "${WHISPER_BACKEND_PORT}" ]] ||
+    die "WHISPER_GATEWAY_PORT 与 WHISPER_BACKEND_PORT 不能相同。"
+
+  validate_integer_range WHISPER_THREADS "${WHISPER_THREADS}" 1 256
+  validate_integer_range WHISPER_MODEL_SIZE_BYTES "${WHISPER_MODEL_SIZE_BYTES}" 1 1099511627776
+  validate_integer_range WHISPER_IDLE_TIMEOUT_SECONDS "${WHISPER_IDLE_TIMEOUT_SECONDS}" 1 604800
+  validate_integer_range WHISPER_STARTUP_TIMEOUT_SECONDS "${WHISPER_STARTUP_TIMEOUT_SECONDS}" 1 86400
+  validate_integer_range WHISPER_SHUTDOWN_TIMEOUT_SECONDS "${WHISPER_SHUTDOWN_TIMEOUT_SECONDS}" 1 3600
+  validate_integer_range WHISPER_REQUEST_TIMEOUT_SECONDS "${WHISPER_REQUEST_TIMEOUT_SECONDS}" 1 86400
+  validate_integer_range WHISPER_MAX_PENDING_REQUESTS "${WHISPER_MAX_PENDING_REQUESTS}" 1 1024
+  validate_integer_range WHISPER_MAX_UPLOAD_BYTES "${WHISPER_MAX_UPLOAD_BYTES}" 1 1099511627776
+  validate_integer_range WHISPER_START_FAILURE_BACKOFF_SECONDS "${WHISPER_START_FAILURE_BACKOFF_SECONDS}" 1 86400
+
+  [[ "${WHISPER_COMMIT}" =~ ^[0-9a-fA-F]{40}$ ]] ||
+    die "WHISPER_COMMIT 必须是 40 位十六进制 commit：${WHISPER_COMMIT}"
+  [[ "${WHISPER_MODEL_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]] ||
+    die "WHISPER_MODEL_SHA256 必须是 64 位十六进制 SHA-256。"
+  [[ "${WHISPER_INFERENCE_PATH}" == /* && "${WHISPER_INFERENCE_PATH}" != *$'\n'* && "${WHISPER_INFERENCE_PATH}" != *[[:space:]]* ]] ||
+    die "WHISPER_INFERENCE_PATH 必须是无空白的绝对 HTTP 路径：${WHISPER_INFERENCE_PATH}"
 }
 
 require_command() {
@@ -127,9 +248,141 @@ server_url() {
   printf 'http://%s:%s%s' "${host}" "${WHISPER_PORT}" "${WHISPER_INFERENCE_PATH}"
 }
 
-pid_is_our_server() {
+process_command_line() {
   local pid="$1"
+  /bin/ps -p "${pid}" -o command= 2>/dev/null |
+    /usr/bin/sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+process_executable_matches() {
+  local pid="$1" expected="$2" actual command
+  actual="$(/bin/ps -p "${pid}" -o comm= 2>/dev/null |
+    /usr/bin/sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true)"
+  [[ "${actual}" == "${expected}" ]] && return 0
+
+  # macOS 的 comm 列在不同系统版本上可能只返回 basename；command 列的
+  # 第一个 token 仍必须是我们传入的绝对可执行路径，不能只做 substring 匹配。
+  command="$(process_command_line "${pid}" || true)"
+  case "${command}" in
+    "${expected}"|"${expected} "*) return 0 ;;
+  esac
+  return 1
+}
+
+command_has_exact_argument_pair() {
+  local command="$1" flag="$2" value="$3"
+  # 参数值来自已校验的 host/port/path；两侧空格是 token 边界，因而不会
+  # 把 --port 18080 误认成 --port 180800。解析失败时宁可拒绝接管/停止。
+  case " ${command} " in
+    *" ${flag} ${value} "*) return 0 ;;
+  esac
+  return 1
+}
+
+pid_is_our_server() {
+  local pid="$1" command
   [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
   kill -0 "${pid}" 2>/dev/null || return 1
-  /bin/ps -p "${pid}" -o command= 2>/dev/null | /usr/bin/grep -F -- "${SERVER_BIN}" >/dev/null
+  process_executable_matches "${pid}" "${SERVER_BIN}" || return 1
+  command="$(process_command_line "${pid}" || true)"
+  command_has_exact_argument_pair "${command}" --host "${WHISPER_HOST}" || return 1
+  command_has_exact_argument_pair "${command}" --port "${WHISPER_PORT}" || return 1
+  command_has_exact_argument_pair "${command}" --model "${MODEL_FILE}" || return 1
+  command_has_exact_argument_pair "${command}" --inference-path "${WHISPER_INFERENCE_PATH}" || return 1
 }
+
+pid_is_our_gateway() {
+  local pid="$1" command
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "${pid}" 2>/dev/null || return 1
+  process_executable_matches "${pid}" "${GATEWAY_BIN}" || return 1
+  command="$(process_command_line "${pid}" || true)"
+  command_has_exact_argument_pair "${command}" --gateway-host "${ON_DEMAND_GATEWAY_HOST}" || return 1
+  command_has_exact_argument_pair "${command}" --gateway-port "${WHISPER_GATEWAY_PORT}" || return 1
+  command_has_exact_argument_pair "${command}" --backend-port "${WHISPER_BACKEND_PORT}" || return 1
+  command_has_exact_argument_pair "${command}" --model "${MODEL_FILE}" || return 1
+  command_has_exact_argument_pair "${command}" --inference-path "${WHISPER_INFERENCE_PATH}" || return 1
+}
+
+pid_from_file() {
+  local pid_file="$1" pid_record
+  [[ -f "${pid_file}" ]] || return 1
+  pid_record="$(<"${pid_file}")"
+  if [[ "${pid_record}" =~ ^[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  # 网关 PID 文件可包含审计元数据（启动时间、二进制、模型和端口）。
+  # 兼容 pid=123、"pid":123 等文本/JSON 记录，但不把任意数字当 PID。
+  if [[ "${pid_record}" =~ (pid[[:space:]]*[=:][[:space:]]*|\"pid\"[[:space:]]*:[[:space:]]*)([0-9]+) ]]; then
+    printf '%s' "${BASH_REMATCH[2]}"
+    return 0
+  fi
+  return 1
+}
+
+listener_pids_for_port() {
+  local port="$1"
+  /usr/sbin/lsof -nP -t -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true
+}
+
+port_is_listening() {
+  [[ -n "$(listener_pids_for_port "$1")" ]]
+}
+
+on_demand_mode_is_running() {
+  if [[ -f "${GATEWAY_PID_FILE}" ]]; then
+    local gateway_pid=""
+    gateway_pid="$(pid_from_file "${GATEWAY_PID_FILE}" 2>/dev/null || true)"
+    [[ -n "${gateway_pid}" ]] && pid_is_our_gateway "${gateway_pid}" && return 0
+  fi
+
+  local listener_pid
+  while IFS= read -r listener_pid; do
+    [[ -n "${listener_pid}" ]] || continue
+    pid_is_our_gateway "${listener_pid}" && return 0
+  done < <(listener_pids_for_port "${WHISPER_GATEWAY_PORT}")
+  return 1
+}
+
+direct_mode_is_running() {
+  if [[ -f "${SERVER_PID_FILE}" ]]; then
+    local server_pid
+    server_pid="$(pid_from_file "${SERVER_PID_FILE}" 2>/dev/null || true)"
+    [[ -n "${server_pid}" ]] && pid_is_our_server "${server_pid}" && return 0
+  fi
+
+  local listener_pid
+  while IFS= read -r listener_pid; do
+    [[ -n "${listener_pid}" ]] || continue
+    pid_is_our_server "${listener_pid}" && return 0
+  done < <(listener_pids_for_port "${WHISPER_PORT}")
+  return 1
+}
+
+gateway_health_url() {
+  local host="${ON_DEMAND_GATEWAY_HOST}"
+  [[ "${host}" == "0.0.0.0" ]] && host="127.0.0.1"
+  printf 'http://%s:%s/health' "${host}" "${WHISPER_GATEWAY_PORT}"
+}
+
+gateway_ready_url() {
+  local host="${ON_DEMAND_GATEWAY_HOST}"
+  [[ "${host}" == "0.0.0.0" ]] && host="127.0.0.1"
+  printf 'http://%s:%s/ready' "${host}" "${WHISPER_GATEWAY_PORT}"
+}
+
+backend_health_url() {
+  printf 'http://%s:%s/health' "${ON_DEMAND_BACKEND_HOST}" "${WHISPER_BACKEND_PORT}"
+}
+
+assert_source_commit() {
+  [[ -d "${SOURCE_DIR}" ]] || die "whisper.cpp 源码目录不存在：${SOURCE_DIR}"
+  require_command git
+  local actual_commit
+  actual_commit="$(git -C "${SOURCE_DIR}" rev-parse HEAD 2>/dev/null || true)"
+  [[ "${actual_commit}" == "${WHISPER_COMMIT}" ]] ||
+    die "whisper.cpp commit 不符：实际 ${actual_commit:-<无法读取>}，预期 ${WHISPER_COMMIT}。"
+}
+
+validate_configuration

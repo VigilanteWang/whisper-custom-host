@@ -16,7 +16,8 @@ usage() {
   05-server.sh logs        跟踪日志
   05-server.sh stop        停止由本脚本启动的后台进程
 
-注意：这不是开机常驻方案；launchd 属于原调研文档第 7 步，不在本交付范围内。
+注意：这是 direct 回滚模式。按需网关运行时拒绝启动 direct，且不会自动
+停止另一模式；切换请先由操作者明确执行对应模式的 stop。
 EOF
 }
 
@@ -40,9 +41,15 @@ prepare() {
   mkdir -p "${RUN_DIR}" "${LOG_DIR}"
 }
 
+assert_direct_mode_available() {
+  if on_demand_mode_is_running; then
+    die "检测到按需网关正在运行（${GATEWAY_BIN}）；拒绝启动 direct，绝不自动停止另一模式。请先执行 scripts/08-on-demand-service.sh stop。"
+  fi
+}
+
 wait_for_health() {
-  local attempt response
-  for attempt in $(/usr/bin/seq 1 120); do
+  local response
+  for _ in $(/usr/bin/seq 1 120); do
     response="$(curl --silent --show-error --max-time 2 "$(health_url)" 2>/dev/null || true)"
     if [[ "${response}" == *'"status":"ok"'* ]]; then
       log "健康检查通过：$(health_url)"
@@ -54,11 +61,12 @@ wait_for_health() {
 }
 
 start_server() {
+  assert_direct_mode_available
   prepare
 
   if [[ -f "${SERVER_PID_FILE}" ]]; then
-    old_pid="$(<"${SERVER_PID_FILE}")"
-    if pid_is_our_server "${old_pid}"; then
+    old_pid="$(pid_from_file "${SERVER_PID_FILE}" 2>/dev/null || true)"
+    if [[ -n "${old_pid}" ]] && pid_is_our_server "${old_pid}"; then
       die "server 已运行，PID=${old_pid}。"
     fi
     warn "移除失效 PID 文件：${SERVER_PID_FILE}"
@@ -104,7 +112,8 @@ status_server() {
     printf '未运行：没有 PID 文件。\n'
     return 1
   fi
-  server_pid="$(<"${SERVER_PID_FILE}")"
+  server_pid="$(pid_from_file "${SERVER_PID_FILE}" 2>/dev/null || true)"
+  [[ -n "${server_pid}" ]] || die "PID 文件无法解析：${SERVER_PID_FILE}；拒绝继续。"
   if ! pid_is_our_server "${server_pid}"; then
     printf '未运行：PID 文件失效（%s）。\n' "${server_pid}"
     return 1
@@ -116,7 +125,8 @@ status_server() {
 
 stop_server() {
   [[ -f "${SERVER_PID_FILE}" ]] || die "没有 PID 文件；server 可能未由本脚本启动。"
-  server_pid="$(<"${SERVER_PID_FILE}")"
+  server_pid="$(pid_from_file "${SERVER_PID_FILE}" 2>/dev/null || true)"
+  [[ -n "${server_pid}" ]] || die "PID 文件无法解析：${SERVER_PID_FILE}；拒绝 kill。"
   pid_is_our_server "${server_pid}" || die "PID ${server_pid} 不是预期的 whisper-server；拒绝 kill。"
   kill "${server_pid}"
   for _ in $(/usr/bin/seq 1 20); do
@@ -136,6 +146,7 @@ case "${action}" in
     start_server
     ;;
   foreground)
+    assert_direct_mode_available
     prepare
     log "前台启动：$(server_url)"
     exec "${server_command[@]}"
