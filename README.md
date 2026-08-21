@@ -1,7 +1,12 @@
-# whisper.cpp 按需语音转写服务
+# 基于 whisper.cpp server 的按需语音转写服务
 
-面向可信局域网的 macOS Apple Silicon 语音转写服务，供 OpenWhispr 使用兼容 OpenAI 风格的
-`/v1/audio/transcriptions` 接口。服务采用固定版本的 `whisper.cpp` 与 `large-v3-turbo` 模型；模型只在有转写请求时运行，空闲后自动释放。
+本项目基于 [whisper.cpp](https://github.com/ggml-org/whisper.cpp) 的 `whisper-server`，额外实现了一个轻量 Gateway。
+Gateway 常驻监听并提供兼容 OpenAI 风格的 `/v1/audio/transcriptions` 接口；收到转写请求后，才按需启动
+`whisper-server` 并加载模型，空闲一段时间后自动退出以释放资源。服务面向可信局域网中的 macOS Apple Silicon
+主机和 OpenWhispr 客户端。
+
+项目同时提供完整的 macOS 下载、依赖安装、`whisper.cpp` 编译、模型下载校验、Gateway 构建验证和 LaunchAgent
+安装脚本，安装流程可以从源码准备一直执行到服务启动。
 
 Gateway 的实现、架构和运行细节见 [gateway/README.md](gateway/README.md)。
 
@@ -20,11 +25,12 @@ Gateway 的实现、架构和运行细节见 [gateway/README.md](gateway/README.
 ├── scripts/
 │   ├── 00-preflight.sh                # 环境、磁盘、端口预检
 │   ├── 01-install-dependencies.sh     # 安装或检查依赖
-│   ├── 02-build-whisper.sh            # 构建固定版本 whisper.cpp
-│   ├── 03-download-model.sh           # 下载并校验唯一模型文件
+│   ├── 02-build-whisper.sh            # 下载并构建固定版本 whisper.cpp server
+│   ├── 03-download-model.sh           # 按 .env 配置下载并校验模型
 │   ├── 04-validate-cli.sh             # CLI 冒烟验证
+│   ├── 05-server.sh                   # direct whisper-server 启停
 │   ├── 06-firewall.sh                 # Application Firewall 检查/精确放行
-│   ├── 07-build-on-demand-gateway.sh  # 构建并验证 Gateway
+│   ├── 07-build-on-demand-gateway.sh  # 构建并验证按需 Gateway
 │   └── 08-on-demand-service.sh        # 安装、启停、状态与日志
 └── tests/                             # Gateway 单元与集成测试
 ```
@@ -44,13 +50,29 @@ OpenWhispr / curl
 whisper-on-demand-gateway  ──  常驻，0.0.0.0:8080，不加载模型
         │  仅本机回环，127.0.0.1:18080
         ▼
-whisper-server             ──  按请求启动，空闲 300 秒后退出
+whisper-server             ──  按请求启动，空闲设定的时间后退出
         │
         ▼
-ggml-large-v3-turbo.bin    ──  唯一权威模型文件
+ggml-${WHISPER_MODEL}.bin   ──  当前配置的模型文件
 ```
 
 客户端只访问 Gateway；后端端口不可暴露到 LAN。
+
+## 模型配置
+
+默认模型是 `large-v3-turbo`。模型可以修改：请在 [ggerganov/whisper.cpp 的 Hugging Face 文件列表](https://huggingface.co/ggerganov/whisper.cpp/tree/main)
+中选择对应的 `ggml-*.bin` 文件，并在 `.env` 中修改模型名及其校验信息。例如文件名为
+`ggml-large-v3-turbo-q5_0.bin` 时，模型名写成 `large-v3-turbo-q5_0`：
+
+```bash
+WHISPER_MODEL="${WHISPER_MODEL:-large-v3-turbo-q5_0}"
+WHISPER_MODEL_SHA256="<该文件的 SHA-256>"
+WHISPER_MODEL_SIZE_BYTES="<该文件的字节数>"
+```
+
+`scripts/03-download-model.sh` 会根据 `WHISPER_MODEL` 拼接 Hugging Face 下载地址，并在安装过程中检查文件大小和
+SHA-256；因此切换模型时要同时更新这三个参数。安装脚本会使用 `.env` 中的配置下载并校验选定模型，CLI、direct
+server 和按需 Gateway 共用这份模型。
 
 ## 简要安装
 
@@ -65,6 +87,9 @@ cp .env.example .env
 ```bash
 ./install.sh --on-demand --start
 ```
+
+该命令会依次完成依赖检查、`whisper.cpp`/`whisper-server` 编译、选定模型下载与校验、Gateway 构建验证、
+LaunchAgent 安装和服务启动。
 
 若尚未安装 Homebrew：
 
@@ -93,11 +118,7 @@ cp .env.example .env
 ./scripts/08-on-demand-service.sh stop
 ./scripts/08-on-demand-service.sh start
 
-# 重新构建并验证 Gateway，随后重新部署服务
-./scripts/07-build-on-demand-gateway.sh
-./scripts/08-on-demand-service.sh start
-
-# 重新构建后清理 Application Support 中的旧运行时，保留模型再启动
+# 重新构建后清理 Application Support 中的旧运行时再启动
 ./scripts/07-build-on-demand-gateway.sh
 ./scripts/08-on-demand-service.sh start --purge
 
@@ -116,14 +137,14 @@ cp .env.example .env
 ./install.sh --on-demand --purge --start
 ```
 
-`--purge` 只清理 Application Support 中除权威模型外的产物；完整卸载前先预览，再确认执行：
+`--purge` 只清理 Application Support 中除模型外的产物；完整卸载前先预览，再确认执行：
 
 ```bash
 ./uninstall.sh --dry-run
 ./uninstall.sh
 ```
 
-完整卸载会删除权威模型、LaunchAgent、Application Support、项目日志、精确防火墙规则以及仓库内的 `build/`、`var/` 和已验证干净的 `third_party/whisper.cpp/`。它保留 Git 跟踪文件、`.env`、仓库 `models/`、其他无关未跟踪文件、Homebrew/共享依赖及 SSH/WOL 和手工系统设置。不要使用 `sudo ./uninstall.sh`。
+完整卸载会删除模型、LaunchAgent、Application Support、项目日志、精确防火墙规则以及仓库内的 `build/`、`var/` 和已验证干净的 `third_party/whisper.cpp/`。它保留 Git 跟踪文件、`.env`、仓库 `models/`、其他无关未跟踪文件、Homebrew/共享依赖及 SSH/WOL 和手工系统设置。不要使用 `sudo ./uninstall.sh`。
 
 LaunchAgent 标准输出与错误日志在：
 
