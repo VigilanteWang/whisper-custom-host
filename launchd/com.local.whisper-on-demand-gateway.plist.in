@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent 单一来源模板。08-on-demand-service.sh 只读取本文件并替换
+  标记；ProgramArguments、绝对路径和 ExitTimeOut 不在脚本中另写一份 plist
+  结构。模板本身保持为合法 plist，便于 plutil -lint 静态检查。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__LAUNCHD_LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <!-- BEGIN_PROGRAM_ARGUMENTS -->
+    <string>__PROGRAM_ARGUMENT__</string>
+    <!-- END_PROGRAM_ARGUMENTS -->
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <!-- EXIT_TIMEOUT_SETTING -->
+  <key>WorkingDirectory</key>
+  <string>__WORKING_DIRECTORY__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>WHISPER_CUSTOM_HOST_MANAGED_BY</key>
+    <string>__MANAGED_BY__</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__STDOUT_PATH__</string>
+  <key>StandardErrorPath</key>
+  <string>__STDERR_PATH__</string>
+</dict>
+</plist>
