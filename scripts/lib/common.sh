@@ -267,6 +267,173 @@ assert_model_file_valid() {
     die "模型 SHA-256 不符：${model_path} 实际 ${actual_hash}"
 }
 
+# Purge is deliberately implemented as a small, independently testable
+# primitive.  It is the only operation in this file that removes anything
+# below Application Support.  Callers must perform all service/process
+# preflight checks before invoking it.
+strip_trailing_slashes() {
+  local value="${1:-}"
+  while [[ "${value}" != "/" && "${value}" == */ ]]; do
+    value="${value%/}"
+  done
+  printf '%s' "${value}"
+}
+
+path_has_symlink_component() {
+  local path="${1:-}" anchor="${2:-/}" remaining component current
+  [[ "${path}" == /* ]] || return 1
+  anchor="$(strip_trailing_slashes "${anchor}")"
+  if [[ "${anchor}" == "/" ]]; then
+    current="/"
+    remaining="${path#/}"
+  else
+    case "${path}" in
+      "${anchor}/"*) ;;
+      *) return 1 ;;
+    esac
+    current="${anchor}"
+    remaining="${path#"${anchor}"/}"
+  fi
+  while [[ -n "${remaining}" ]]; do
+    if [[ "${remaining}" == */* ]]; then
+      component="${remaining%%/*}"
+      remaining="${remaining#*/}"
+    else
+      component="${remaining}"
+      remaining=""
+    fi
+    [[ -n "${component}" && "${component}" != "." ]] || continue
+    [[ "${component}" != ".." ]] || return 1
+    current="${current%/}/${component}"
+    [[ -L "${current}" ]] && return 0
+  done
+  return 1
+}
+
+validate_purge_root_safety() {
+  local root home project
+  root="$(strip_trailing_slashes "${WHISPER_APP_SUPPORT_ROOT:-}")"
+  [[ -n "${root}" && "${root}" == /* ]] ||
+    die "Purge 根目录必须是非空绝对路径：${WHISPER_APP_SUPPORT_ROOT:-<空>}"
+  [[ "${root}" != *$'\n'* && "${root}" != *$'\r'* ]] ||
+    die "Purge 根目录不能包含换行：${root}"
+  [[ "${root}" != *"/../"* && "${root}" != */.. && \
+    "${root}" != *"/./"* && "${root}" != */. ]] ||
+    die "Purge 根目录不能包含 . 或 .. 路径组件：${root}"
+  [[ "${root}" != "/" ]] || die "拒绝把 / 作为 Purge 根目录。"
+  [[ ! -L "${root}" ]] || die "Purge 根目录不能是符号链接：${root}"
+  if [[ -e "${root}" && ! -d "${root}" ]]; then
+    die "Purge 根目录不是目录：${root}"
+  fi
+  path_has_symlink_component "${root}" &&
+    die "Purge 根目录路径包含符号链接组件：${root}"
+  [[ "${root##*/}" == "whisper-custom-host" ]] ||
+    die "Purge 根目录 basename 必须是 whisper-custom-host：${root}"
+
+  home="$(strip_trailing_slashes "${HOME:-}")"
+  project="$(strip_trailing_slashes "${PROJECT_ROOT:-}")"
+  case "${root}" in
+    "${home}"|"${home}/Library"|"${home}/Library/Logs"|\
+    "${home}/Library/Application Support"|\
+    "/Library"|"/System"|"/Applications"|"/Users"|"/private"|\
+    "/private/var"|"/tmp"|"/private/tmp"|\
+    "${project}")
+      die "Purge 根目录过于宽泛或指向项目目录：${root}"
+      ;;
+  esac
+  # Reject only the checkout itself, a path inside it, or a path that is its
+  # ancestor.  A normal Application Support sibling must remain allowed when
+  # the checkout is under Documents (or directly under HOME).
+  case "${root}" in
+    "${project}"|"${project}/"*)
+      die "Purge 根目录不能位于项目目录或其父目录：${root}"
+      ;;
+  esac
+  case "${project}" in
+    "${root}"|"${root}/"*)
+      die "Purge 根目录不能是项目目录的父目录：${root}"
+      ;;
+  esac
+}
+
+validate_purge_model() {
+  local root model
+  validate_purge_root_safety
+  [[ "${WHISPER_MODEL}" != *"/"* && "${WHISPER_MODEL}" != *"\\"* && \
+    "${WHISPER_MODEL}" != *$'\n'* && "${WHISPER_MODEL}" != *$'\r'* ]] ||
+    die "Purge 不接受含路径分隔符或换行的模型名：${WHISPER_MODEL}"
+  root="$(strip_trailing_slashes "${WHISPER_APP_SUPPORT_ROOT}")"
+  model="$(strip_trailing_slashes "${MODEL_FILE}")"
+  case "${model}" in
+    "${root}/"*) ;;
+    *) die "权威模型路径不在 Purge 根目录内：${MODEL_FILE}" ;;
+  esac
+
+  # -L must be checked before -e because a dangling symlink is not -e.  A
+  # symlink in an intermediate model path is equally unsafe to preserve.
+  if [[ -L "${model}" || -e "${model}" ]]; then
+    path_has_symlink_component "${model}" "${root}" &&
+      die "权威模型路径包含符号链接：${MODEL_FILE}"
+    [[ -f "${model}" && ! -L "${model}" ]] ||
+      die "权威模型必须是普通文件：${MODEL_FILE}"
+    assert_model_valid
+  fi
+}
+
+purge_application_support() {
+  local root model path model_size model_sha model_owner model_mode model_mtime
+  validate_purge_model
+  root="$(strip_trailing_slashes "${WHISPER_APP_SUPPORT_ROOT}")"
+  model="$(strip_trailing_slashes "${MODEL_FILE}")"
+
+  # Capture attributes before traversal.  The model is never passed to rm;
+  # the post-check also detects an unexpected concurrent modification.
+  if [[ -f "${model}" && ! -L "${model}" ]]; then
+    model_size="$(file_size_bytes "${model}")"
+    model_sha="$(sha256_file "${model}")"
+    model_owner="$(/usr/bin/stat -f '%u' "${model}")"
+    model_mode="$(/usr/bin/stat -f '%Lp' "${model}")"
+    model_mtime="$(/usr/bin/stat -f '%m' "${model}")"
+  else
+    model_size=""
+    model_sha=""
+    model_owner=""
+    model_mode=""
+    model_mtime=""
+  fi
+
+  if [[ -d "${root}" ]]; then
+    # -depth permits removing empty parents after their non-authoritative
+    # children.  Ancestors of MODEL_FILE are retained so the exact model path
+    # remains usable; every other regular, hidden, temporary, or unknown
+    # entry is removed, including symlink entries (without following them).
+    while IFS= read -r -d '' path; do
+      [[ "${path}" == "${model}" ]] && continue
+      case "${model}" in
+        "${path}/"*) continue ;;
+      esac
+      rm -rf -- "${path}" ||
+        die "Purge 删除失败：${path}"
+    done < <(/usr/bin/find "${root}" -mindepth 1 -depth -print0)
+  fi
+
+  if [[ -n "${model_size}" ]]; then
+    [[ -f "${model}" && ! -L "${model}" ]] ||
+      die "Purge 后权威模型消失或变成符号链接：${model}"
+    [[ "$(file_size_bytes "${model}")" == "${model_size}" ]] ||
+      die "Purge 后权威模型大小发生变化：${model}"
+    [[ "$(sha256_file "${model}")" == "${model_sha}" ]] ||
+      die "Purge 后权威模型 SHA-256 发生变化：${model}"
+    [[ "$(/usr/bin/stat -f '%u' "${model}")" == "${model_owner}" ]] ||
+      die "Purge 后权威模型所有者发生变化：${model}"
+    [[ "$(/usr/bin/stat -f '%Lp' "${model}")" == "${model_mode}" ]] ||
+      die "Purge 后权威模型权限发生变化：${model}"
+    [[ "$(/usr/bin/stat -f '%m' "${model}")" == "${model_mtime}" ]] ||
+      die "Purge 后权威模型时间信息发生变化：${model}"
+  fi
+  log "Application Support purge 完成（权威模型保留）：${root}"
+}
+
 health_url() {
   local host="${WHISPER_HOST}"
   [[ "${host}" == "0.0.0.0" ]] && host="127.0.0.1"

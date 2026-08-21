@@ -10,6 +10,7 @@ Gateway 的实现、架构和运行细节见 [gateway/README.md](gateway/README.
 ```text
 .
 ├── install.sh                         # 一键安装入口
+├── uninstall.sh                       # 完整卸载入口
 ├── .env.example                       # 可覆盖的本机配置模板
 ├── client/
 │   └── verify-server.sh               # 从另一台 LAN 主机验证服务
@@ -96,13 +97,33 @@ cp .env.example .env
 ./scripts/07-build-on-demand-gateway.sh
 ./scripts/08-on-demand-service.sh start
 
-# 仅卸载本工具创建的 LaunchAgent（不删除模型）
+# 重新构建后清理 Application Support 中的旧运行时，保留模型再启动
+./scripts/07-build-on-demand-gateway.sh
+./scripts/08-on-demand-service.sh start --purge
+
+# 仅卸载本工具创建的 LaunchAgent；加 --purge 时仍保留模型
 ./scripts/08-on-demand-service.sh uninstall
+./scripts/08-on-demand-service.sh uninstall --purge
 
 # 只读检查防火墙；确需放行时才加 --apply
 ./scripts/06-firewall.sh --target on-demand
 ./scripts/06-firewall.sh --target on-demand --apply
 ```
+
+安装入口也可在完成 07 构建后清理旧运行时，再部署或启动：
+
+```bash
+./install.sh --on-demand --purge --start
+```
+
+`--purge` 只清理 Application Support 中除权威模型外的产物；完整卸载前先预览，再确认执行：
+
+```bash
+./uninstall.sh --dry-run
+./uninstall.sh
+```
+
+完整卸载会删除权威模型、LaunchAgent、Application Support、项目日志、精确防火墙规则以及仓库内的 `build/`、`var/` 和已验证干净的 `third_party/whisper.cpp/`。它保留 Git 跟踪文件、`.env`、仓库 `models/`、其他无关未跟踪文件、Homebrew/共享依赖及 SSH/WOL 和手工系统设置。不要使用 `sudo ./uninstall.sh`。
 
 LaunchAgent 标准输出与错误日志在：
 

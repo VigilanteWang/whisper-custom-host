@@ -200,7 +200,13 @@ WHISPER_HOST/WHISPER_PORT 是 direct 模式配置，不能用来改变按需网�
 ./install.sh --install-homebrew --on-demand --start
 ~~~
 
-不立即启动时去掉 --start。也可以在已有 whisper.cpp 构建和模型的情况下分步执行：
+重新安装时如需保留权威模型、同时清理 Application Support 中的其他旧产物：
+
+~~~bash
+./install.sh --on-demand --purge --start
+~~~
+
+--purge 只能与 --on-demand 一起使用。不立即启动时去掉 --start。也可以在已有 whisper.cpp 构建和模型的情况下分步执行：
 
 ~~~bash
 ./scripts/07-build-on-demand-gateway.sh
@@ -284,12 +290,31 @@ LaunchAgent 文件和其标准输出/错误日志分别位于：
 ./scripts/08-on-demand-service.sh stop
 ./scripts/08-on-demand-service.sh start
 
-# 停止并删除本工具生成的 plist；模型、构建和运行日志保留
+# 停止、清理旧运行时并重新部署/启动；权威模型保留
+./scripts/08-on-demand-service.sh install --purge
+./scripts/08-on-demand-service.sh start --purge
+
+# 停止并删除本工具生成的 plist；不带 purge 时其他产物保留
 ./scripts/08-on-demand-service.sh uninstall
+
+# 再清理 Application Support 中除权威模型外的所有产物
+./scripts/08-on-demand-service.sh uninstall --purge
 
 # 不接入 launchd 的前台排障模式（使用前先 stop）
 ./scripts/08-on-demand-service.sh foreground
 ~~~
+
+purge 执行前会校验当前用户、删除根路径和模型的大小、SHA-256、所有者及权限。`start --purge` 还会要求已运行网关处于 cold、无活动或排队请求；然后只 bootout 本工具的 LaunchAgent，等待 Gateway/backend 完全退出后再清理。它删除已部署二进制、dylib、header/commit 证明、PID、上传、Application Support 内日志、`model.txt` 及其他旁车文件，但不删除权威模型、LaunchAgent 标准输出/错误日志、仓库构建或 `.env`。install/start 在清理后会重新生成所需的最小运行时。
+
+根目录的完整卸载入口与上述两种维护操作不同：
+
+~~~bash
+./uninstall.sh --dry-run
+./uninstall.sh        # 交互式确认
+./uninstall.sh --yes  # 非交互执行，sudo 授权仍可能询问
+~~~
+
+完整卸载会优雅停止 direct/Gateway、删除权威模型、Application Support、Library Logs、自有 plist、精确的当前/历史项目防火墙规则，并清理 `build/`、`var/` 和已验证干净的 `third_party/whisper.cpp/`。它保留 Git 跟踪文件、`.env`、仓库 `models/`、其他无关未跟踪文件、Homebrew/共享依赖、SSH/WOL、helper/sudoers 和手工系统设置。不要用 sudo 运行脚本本身；脚本只在删除精确防火墙条目时单独请求管理员授权。
 
 更新网关代码或 whisper.cpp 后，先重新运行 07-build-on-demand-gateway.sh，再运行
 08-on-demand-service.sh install/start。服务脚本会核对二进制和 header SHA-256、模型完整性及
