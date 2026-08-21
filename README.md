@@ -2,7 +2,7 @@
 
 本项目基于 [whisper.cpp](https://github.com/ggml-org/whisper.cpp) 的 `whisper-server`，额外实现了一个轻量 Gateway。
 Gateway 常驻监听并提供兼容 OpenAI 风格的 `/v1/audio/transcriptions` 接口；收到转写请求后，才按需启动
-`whisper-server` 并加载模型，空闲一段时间后自动退出以释放资源。服务面向可信局域网中的 macOS Apple Silicon
+`whisper-server` 并加载模型，空闲一段时间后自动退出以释放资源。服务可部署在局域网中的 macOS Apple Silicon
 主机和 OpenWhispr 客户端。
 
 项目同时提供完整的 macOS 下载、依赖安装、`whisper.cpp` 编译、模型下载校验、Gateway 构建验证和 LaunchAgent
